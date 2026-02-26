@@ -91,18 +91,13 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 	// Determine concurrency. Use number of docs or CPUs, whichever is smaller.
 	numCPUs := runtime.NumCPU()
 	numDocs := len(docs)
-	concurrency := numCPUs
-	if numDocs < numCPUs {
-		concurrency = numDocs
-	}
+	concurrency := min(numDocs, numCPUs)
 
 	docChan := make(chan *Document, concurrency*2)
 
 	wg := sync.WaitGroup{}
 	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for doc := range docChan {
 				if documentMatchesFilters(doc, where, whereDocument) {
 					filteredDocsLock.Lock()
@@ -110,7 +105,7 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 					filteredDocsLock.Unlock()
 				}
 			}
-		}()
+		})
 	}
 
 	for _, doc := range docs {
@@ -168,10 +163,7 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 	// Determine concurrency. Use number of docs or CPUs, whichever is smaller.
 	numCPUs := runtime.NumCPU()
 	numDocs := len(docs)
-	concurrency := numCPUs
-	if numDocs < numCPUs {
-		concurrency = numDocs
-	}
+	concurrency := min(numDocs, numCPUs)
 
 	var sharedErr error
 	sharedErrLock := sync.Mutex{}

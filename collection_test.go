@@ -428,13 +428,7 @@ func TestCollection_ListIDs(t *testing.T) {
 		t.Fatal("expected", len(ids), "got", len(foundIds))
 	}
 	for _, id := range ids {
-		found := false
-		for _, foundID := range foundIds {
-			if id == foundID {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(foundIds, id)
 		if !found {
 			t.Fatal("expected", id, "in", foundIds)
 		}
@@ -924,7 +918,7 @@ func benchmarkCollection_Query(b *testing.B, n int, withContent bool) {
 	d := 1536 // dimensions, same as text-embedding-3-small
 	// Random query vector
 	qv := make([]float32, d)
-	for j := 0; j < d; j++ {
+	for j := range d {
 		qv[j] = r.Float32()
 	}
 	// The document embeddings are normalized, so the query must be normalized too.
@@ -945,10 +939,10 @@ func benchmarkCollection_Query(b *testing.B, n int, withContent bool) {
 	}
 
 	// Add documents
-	for i := 0; i < n; i++ {
+	for i := range n {
 		// Random embedding
 		v := make([]float32, d)
-		for j := 0; j < d; j++ {
+		for j := range d {
 			v[j] = r.Float32()
 		}
 		v = normalizeVector(v)
@@ -1037,7 +1031,7 @@ func benchmarkCloneDocumentN(b *testing.B, n int) {
 	var res *Document
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		for j := 0; j < n; j++ {
+		for range n {
 			res = cloneDocument(doc)
 		}
 	}
@@ -1055,7 +1049,7 @@ func benchmarkMakePartialDocumentN(b *testing.B, n int) {
 	var res *Document
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		for j := 0; j < n; j++ {
+		for range n {
 			res = makePartialDocument(doc)
 		}
 	}

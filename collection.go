@@ -95,9 +95,7 @@ func newCollection(name string, metadata map[string]string, embed EmbeddingFunc,
 	// We copy the metadata to avoid data races in case the caller modifies the
 	// map after creating the collection while we range over it.
 	m := make(map[string]string, len(metadata))
-	for k, v := range metadata {
-		m[k] = v
-	}
+	maps.Copy(m, metadata)
 
 	c := &Collection{
 		Name: name,
@@ -258,9 +256,7 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 	// We copy the metadata to avoid data races in case the caller modifies the
 	// map after creating the document while we range over it.
 	m := make(map[string]string, len(doc.Metadata))
-	for k, v := range doc.Metadata {
-		m[k] = v
-	}
+	maps.Copy(m, doc.Metadata)
 
 	// Create embedding if they don't exist, otherwise normalize if necessary
 	if len(doc.Embedding) == 0 {
@@ -598,10 +594,7 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 
 	// If the filtering already reduced the number of documents to fewer than nResults,
 	// we only need to find the most similar docs among the filtered ones.
-	resLen := nResults
-	if len(filteredDocs) < nResults {
-		resLen = len(filteredDocs)
-	}
+	resLen := min(len(filteredDocs), nResults)
 
 	// For the remaining documents, get the most similar docs.
 	nMaxDocs, err := getMostSimilarDocs(ctx, queryEmbedding, negativeEmbeddings, negativeFilterThreshold, filteredDocs, resLen)
@@ -610,7 +603,7 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	}
 
 	res := make([]Result, 0, len(nMaxDocs))
-	for i := 0; i < len(nMaxDocs); i++ {
+	for i := range nMaxDocs {
 		res = append(res, Result{
 			ID:         nMaxDocs[i].docID,
 			Metadata:   c.documents[nMaxDocs[i].docID].Metadata,

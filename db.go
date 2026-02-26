@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -525,9 +526,7 @@ func (db *DB) ListCollections() map[string]*Collection {
 	defer db.collectionsLock.RUnlock()
 
 	res := make(map[string]*Collection, len(db.collections))
-	for k, v := range db.collections {
-		res[k] = v
-	}
+	maps.Copy(res, db.collections)
 
 	return res
 }
