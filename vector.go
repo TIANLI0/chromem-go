@@ -17,12 +17,7 @@ func dotProduct(a, b []float32) (float32, error) {
 		return 0, errors.New("vectors must have the same length")
 	}
 
-	var dotProduct float32
-	for i := range a {
-		dotProduct += a[i] * b[i]
-	}
-
-	return dotProduct, nil
+	return dotProductOptimized(a, b), nil
 }
 
 func normalizeVector(v []float32) []float32 {

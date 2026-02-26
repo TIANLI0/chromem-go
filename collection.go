@@ -520,14 +520,15 @@ func (c *Collection) QueryWithOptions(ctx context.Context, options QueryOptions)
 			negativeVector = normalizeVector(negativeVector)
 		}
 
-		if options.Negative.Mode == NEGATIVE_MODE_SUBTRACT {
+		switch options.Negative.Mode {
+		case NEGATIVE_MODE_SUBTRACT:
 			queryVector = subtractVector(queryVector, negativeVector)
 			queryVector = normalizeVector(queryVector)
-		} else if options.Negative.Mode == NEGATIVE_MODE_FILTER {
+		case NEGATIVE_MODE_FILTER:
 			if negativeFilterThreshold == 0 {
 				negativeFilterThreshold = DEFAULT_NEGATIVE_FILTER_THRESHOLD
 			}
-		} else {
+		default:
 			return nil, fmt.Errorf("unsupported negative mode: %q", options.Negative.Mode)
 		}
 	}

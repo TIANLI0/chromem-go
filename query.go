@@ -96,7 +96,7 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 	docChan := make(chan *Document, concurrency*2)
 
 	wg := sync.WaitGroup{}
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		wg.Go(func() {
 			for doc := range docChan {
 				if documentMatchesFilters(doc, where, whereDocument) {
@@ -186,7 +186,7 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 	// This turned out to be faster in the query benchmarks.
 	subSliceSize := len(docs) / concurrency // Can leave remainder, e.g. 10/3 = 3; leaves 1
 	rem := len(docs) % concurrency
-	for i := 0; i < concurrency; i++ {
+	for i := range concurrency {
 		start := i * subSliceSize
 		end := start + subSliceSize
 		// Add remainder to last goroutine

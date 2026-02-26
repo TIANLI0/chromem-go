@@ -7,13 +7,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
 
 func TestNewPersistentDB(t *testing.T) {
 	t.Run("Create directory", func(t *testing.T) {
 		r := rand.New(rand.NewSource(rand.Int63()))
-		randString := randomString(r, 10)
+		randString := randomPathComponent(r, 10)
 		path := filepath.Join(os.TempDir(), randString)
 		defer os.RemoveAll(path)
 
@@ -69,7 +70,7 @@ func TestNewPersistentDB_Errors(t *testing.T) {
 
 func TestDB_ImportExport(t *testing.T) {
 	r := rand.New(rand.NewSource(rand.Int63()))
-	randString := randomString(r, 10)
+	randString := randomPathComponent(r, 10)
 	path := filepath.Join(os.TempDir(), randString)
 	defer os.RemoveAll(path)
 
@@ -165,7 +166,7 @@ func TestDB_ImportExport(t *testing.T) {
 
 func TestDB_ImportExportSpecificCollections(t *testing.T) {
 	r := rand.New(rand.NewSource(rand.Int63()))
-	randString := randomString(r, 10)
+	randString := randomPathComponent(r, 10)
 	path := filepath.Join(os.TempDir(), randString)
 	filePath := path + ".gob"
 	defer os.RemoveAll(path)
@@ -224,7 +225,7 @@ func TestDB_ImportExportSpecificCollections(t *testing.T) {
 		t.Fatal("expected no error, got", err)
 	}
 
-	dir := filepath.Join(path, randomString(r, 10))
+	dir := filepath.Join(path, randomPathComponent(r, 10))
 	defer os.RemoveAll(dir)
 
 	// Instead of importing to an in-memory DB we use a persistent one to cover the behavior of immediate persistent files being created for the imported data
@@ -277,6 +278,15 @@ func TestDB_ImportExportSpecificCollections(t *testing.T) {
 			}
 		}
 	}
+}
+
+func randomPathComponent(r *rand.Rand, n int) string {
+	s := strings.TrimSpace(randomString(r, n))
+	s = strings.ReplaceAll(s, " ", "_")
+	if s == "" {
+		return "tmp"
+	}
+	return s
 }
 
 func TestDB_CreateCollection(t *testing.T) {

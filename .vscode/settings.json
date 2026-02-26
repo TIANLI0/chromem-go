@@ -1,0 +1,10 @@
+{
+  "gopls": {
+    "buildFlags": [
+      "-tags=goexperiment.simd"
+    ]
+  },
+  "go.toolsEnvVars": {
+    "GOEXPERIMENT": "simd"
+  }
+}
