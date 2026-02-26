@@ -93,12 +93,12 @@ func queryConcurrency(numDocs int, vectorDim int) int {
 	}
 
 	concurrency := max(numCPUs/2, 1)
-	if numDocs < 2048 {
+	if numDocs < getQuerySmallDocsThreshold() {
 		concurrency = numCPUs
 	}
 
-	if vectorDim >= 2048 {
-		concurrency = max(concurrency/2, 1)
+	if vectorDim >= getQueryHighDimThreshold() {
+		concurrency = max(concurrency/getQueryHighDimConcurrencyDivisor(), 1)
 	}
 
 	return min(numDocs, concurrency)
@@ -136,7 +136,7 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 		return docsSlice
 	}
 
-	if concurrency == 1 || numDocs < 512 {
+	if concurrency == 1 || numDocs < getQuerySequentialDocsThreshold() {
 		filteredDocs := documentSlicePool.Get().([]*Document)
 		filteredDocs = filteredDocs[:0]
 		for _, doc := range docsSlice {
@@ -237,7 +237,7 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 		return nil, nil
 	}
 
-	if concurrency == 1 || numDocs < 512 {
+	if concurrency == 1 || numDocs < getQuerySequentialDocsThreshold() {
 		localMaxDocs := newMaxDocSims(n)
 		for _, doc := range docs {
 			sim, err := dotProduct(queryVectors, doc.Embedding)
