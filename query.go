@@ -84,10 +84,7 @@ func queryConcurrency(numDocs int) int {
 		return 1
 	}
 
-	concurrency := numCPUs / 2
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	concurrency := max(numCPUs/2, 1)
 
 	return min(numDocs, concurrency)
 }
@@ -106,9 +103,7 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 
 	wg := sync.WaitGroup{}
 	for range concurrency {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			localMatches := make([]*Document, 0, numDocs/concurrency+1)
 			for doc := range docChan {
 				if documentMatchesFilters(doc, where, whereDocument) {
@@ -116,7 +111,7 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 				}
 			}
 			resultsChan <- localMatches
-		}()
+		})
 	}
 
 	for _, doc := range docs {
