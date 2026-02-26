@@ -32,7 +32,7 @@ func main() {
 	log.Println("Question: " + question)
 	log.Println("Asking LLM...")
 	reply := askLLM(ctx, nil, question)
-	log.Printf("Initial reply from the LLM: \"" + reply + "\"\n")
+	log.Printf("%s", "Initial reply from the LLM: \""+reply+"\"\n")
 
 	// Now we use our vector database for retrieval augmented generation (RAG),
 	// which means we provide the LLM with relevant knowledge.
@@ -132,7 +132,7 @@ func main() {
 	contexts := []string{docRes[0].Content, docRes[1].Content}
 	log.Println("Asking LLM with augmented question...")
 	reply = askLLM(ctx, contexts, question)
-	log.Printf("Reply after augmenting the question with knowledge: \"" + reply + "\"\n")
+	log.Printf("%s", "Reply after augmenting the question with knowledge: \""+reply+"\"\n")
 
 	/* Output (can differ slightly on each run):
 	2024/03/02 20:02:30 Warming up Ollama...
