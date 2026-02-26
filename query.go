@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var supportedFilters = []string{"$contains", "$not_contains"}
@@ -85,8 +86,32 @@ func queryConcurrency(numDocs int) int {
 	}
 
 	concurrency := max(numCPUs/2, 1)
+	if numDocs < 2048 {
+		concurrency = numCPUs
+	}
 
 	return min(numDocs, concurrency)
+}
+
+func queryChunkSize(numDocs int) int {
+	switch {
+	case numDocs >= 100_000:
+		return 1024
+	case numDocs >= 25_000:
+		return 512
+	case numDocs >= 5_000:
+		return 256
+	default:
+		return 128
+	}
+}
+
+func docsFromMap(docs map[string]*Document) []*Document {
+	res := make([]*Document, 0, len(docs))
+	for _, doc := range docs {
+		res = append(res, doc)
+	}
+	return res
 }
 
 // filterDocs filters a map of documents by metadata and content.
@@ -98,32 +123,56 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 		return nil
 	}
 
-	docChan := make(chan *Document, concurrency*2)
-	resultsChan := make(chan []*Document, concurrency)
+	docsSlice := docsFromMap(docs)
+
+	if len(where) == 0 && len(whereDocument) == 0 {
+		return docsSlice
+	}
+
+	if concurrency == 1 || numDocs < 512 {
+		filteredDocs := make([]*Document, 0, numDocs)
+		for _, doc := range docsSlice {
+			if documentMatchesFilters(doc, where, whereDocument) {
+				filteredDocs = append(filteredDocs, doc)
+			}
+		}
+		if len(filteredDocs) == 0 {
+			return nil
+		}
+		return filteredDocs
+	}
+
+	chunkSize := queryChunkSize(numDocs)
+	var nextIndex atomic.Int64
+	workerResults := make([][]*Document, concurrency)
 
 	wg := sync.WaitGroup{}
-	for range concurrency {
-		wg.Go(func() {
+	for workerIndex := range concurrency {
+		wg.Add(1)
+		go func(workerIndex int) {
+			defer wg.Done()
 			localMatches := make([]*Document, 0, numDocs/concurrency+1)
-			for doc := range docChan {
-				if documentMatchesFilters(doc, where, whereDocument) {
-					localMatches = append(localMatches, doc)
+			for {
+				start := int(nextIndex.Add(int64(chunkSize)) - int64(chunkSize))
+				if start >= numDocs {
+					break
+				}
+
+				end := min(start+chunkSize, numDocs)
+				for _, doc := range docsSlice[start:end] {
+					if documentMatchesFilters(doc, where, whereDocument) {
+						localMatches = append(localMatches, doc)
+					}
 				}
 			}
-			resultsChan <- localMatches
-		})
+			workerResults[workerIndex] = localMatches
+		}(workerIndex)
 	}
-
-	for _, doc := range docs {
-		docChan <- doc
-	}
-	close(docChan)
 
 	wg.Wait()
-	close(resultsChan)
 
-	filteredDocs := make([]*Document, 0, len(docs))
-	for localMatches := range resultsChan {
+	filteredDocs := make([]*Document, 0, numDocs)
+	for _, localMatches := range workerResults {
 		filteredDocs = append(filteredDocs, localMatches...)
 	}
 
@@ -176,6 +225,31 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 		return nil, nil
 	}
 
+	if concurrency == 1 || numDocs < 512 {
+		localMaxDocs := newMaxDocSims(n)
+		for _, doc := range docs {
+			sim, err := dotProduct(queryVectors, doc.Embedding)
+			if err != nil {
+				return nil, fmt.Errorf("couldn't calculate similarity for document '%s': %w", doc.ID, err)
+			}
+
+			if negativeFilterThreshold > 0 {
+				nsim, err := dotProduct(negativeVector, doc.Embedding)
+				if err != nil {
+					return nil, fmt.Errorf("couldn't calculate negative similarity for document '%s': %w", doc.ID, err)
+				}
+
+				if nsim > negativeFilterThreshold {
+					continue
+				}
+			}
+
+			localMaxDocs.add(docSim{doc: doc, similarity: sim})
+		}
+
+		return localMaxDocs.values(), nil
+	}
+
 	var sharedErr error
 	sharedErrLock := sync.Mutex{}
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -193,52 +267,54 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 
 	wg := sync.WaitGroup{}
 	workerResults := make([][]docSim, concurrency)
-	// Instead of using a channel to pass documents into the goroutines, we just
-	// split the slice into sub-slices and pass those to the goroutines.
-	// This turned out to be faster in the query benchmarks.
-	subSliceSize := len(docs) / concurrency // Can leave remainder, e.g. 10/3 = 3; leaves 1
-	rem := len(docs) % concurrency
+	chunkSize := queryChunkSize(numDocs)
+	var nextIndex atomic.Int64
 	for i := range concurrency {
-		start := i * subSliceSize
-		end := start + subSliceSize
-		// Add remainder to last goroutine
-		if i == concurrency-1 {
-			end += rem
-		}
 
 		wg.Add(1)
-		go func(workerIndex int, subSlice []*Document) {
+		go func(workerIndex int) {
 			defer wg.Done()
 			localMaxDocs := newMaxDocSims(n)
-			for _, doc := range subSlice {
-				// Stop work if another goroutine encountered an error.
+			for {
 				if ctx.Err() != nil {
-					return
+					break
 				}
 
-				// As the vectors are normalized, the dot product is the cosine similarity.
-				sim, err := dotProduct(queryVectors, doc.Embedding)
-				if err != nil {
-					setSharedErr(fmt.Errorf("couldn't calculate similarity for document '%s': %w", doc.ID, err))
-					return
+				start := int(nextIndex.Add(int64(chunkSize)) - int64(chunkSize))
+				if start >= numDocs {
+					break
 				}
 
-				if negativeFilterThreshold > 0 {
-					nsim, err := dotProduct(negativeVector, doc.Embedding)
+				end := min(start+chunkSize, numDocs)
+				for _, doc := range docs[start:end] {
+					if ctx.Err() != nil {
+						break
+					}
+
+					// As the vectors are normalized, the dot product is the cosine similarity.
+					sim, err := dotProduct(queryVectors, doc.Embedding)
 					if err != nil {
-						setSharedErr(fmt.Errorf("couldn't calculate negative similarity for document '%s': %w", doc.ID, err))
-						return
+						setSharedErr(fmt.Errorf("couldn't calculate similarity for document '%s': %w", doc.ID, err))
+						break
 					}
 
-					if nsim > negativeFilterThreshold {
-						continue
+					if negativeFilterThreshold > 0 {
+						nsim, err := dotProduct(negativeVector, doc.Embedding)
+						if err != nil {
+							setSharedErr(fmt.Errorf("couldn't calculate negative similarity for document '%s': %w", doc.ID, err))
+							break
+						}
+
+						if nsim > negativeFilterThreshold {
+							continue
+						}
 					}
+
+					localMaxDocs.add(docSim{doc: doc, similarity: sim})
 				}
-
-				localMaxDocs.add(docSim{doc: doc, similarity: sim})
 			}
 			workerResults[workerIndex] = localMaxDocs.values()
-		}(i, docs[start:end])
+		}(i)
 	}
 
 	wg.Wait()

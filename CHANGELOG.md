@@ -19,6 +19,13 @@ vNext
 - Added code comments to clarify OpenAI default embedding func (PR [#109](https://github.com/philippgille/chromem-go/pull/109))
 - Switched from Ollama's OpenAI-compatible embedding endpoint to their "native" one (PR [#115](https://github.com/philippgille/chromem-go/pull/115) by [@hungrymonkey](https://github.com/hungrymonkey))
   - This requires at least Ollama [v0.3.4](https://github.com/ollama/ollama/releases/tag/v0.3.4) from 2024-08-06.
+- Improved query performance internals with chunk-based work scheduling and per-worker top-k aggregation to reduce contention in multi-threaded search.
+- Added optional SIMD-accelerated dot product path (Go `GOEXPERIMENT=simd` on amd64) with configurable runtime threshold (`CHROMEM_SIMD_MIN_LENGTH` / `SetSIMDMinLength`).
+- Improved Windows test stability by sanitizing random path components used for temporary persistence paths.
+- Added benchmark tooling scripts for matrix runs and report regeneration:
+  - `benchmark_matrix.ps1`
+  - `rebuild_compare.ps1`
+- Added performance tuning guidance (SIMD + concurrency) and reproducible benchmark workflow to the README.
 
 v0.7.0 (2024-09-01)
 -------------------

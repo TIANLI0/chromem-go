@@ -297,6 +297,43 @@ ok   github.com/philippgille/chromem-go 28.402s
   1. Install `benchstat`: `go install golang.org/x/perf/cmd/benchstat@latest`
   2. Compare two benchmark results: `benchstat before.out after.out`
 
+### Performance tuning (SIMD + concurrency)
+
+The query path supports a SIMD-optimized dot product (Go `GOEXPERIMENT=simd`, AMD64) and adaptive multi-threaded scheduling.
+
+- SIMD can be enabled for benchmarking via `GOEXPERIMENT=simd`.
+- The runtime threshold for switching from scalar to SIMD dot product can be configured with env var `CHROMEM_SIMD_MIN_LENGTH` or programmatically with `chromem.SetSIMDMinLength()`.
+- The default threshold is `1024`.
+
+Based on benchmark runs on Intel i7-14700F:
+
+- Dot product (`optimized`) is significantly faster for vectors `>= 1024` dimensions.
+- End-to-end query performance also improves, but gains are smaller than raw dot-product gains because filtering, heap maintenance, scheduling, and memory bandwidth become dominant.
+- A practical default is `CHROMEM_SIMD_MIN_LENGTH=1024` for balanced single-core and multi-core performance.
+
+#### Reproducible matrix benchmark
+
+Use the included PowerShell script to benchmark baseline vs SIMD across CPU sets and thresholds:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\benchmark_matrix.ps1
+```
+
+This runs:
+
+- baseline (no SIMD)
+- SIMD with thresholds `0`, `1024`, `1536`
+- CPU sets `1` and `8`
+- `benchstat` comparisons for each pair
+
+Results are written to `bench-results/run-<timestamp>/compare-*.txt`.
+
+If your benchmark outputs were created with an incompatible encoding, regenerate compare files with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\rebuild_compare.ps1 -RunDir .\bench-results\run-<timestamp>
+```
+
 ## Motivation
 
 In December 2023, when I wanted to play around with retrieval augmented generation (RAG) in a Go program, I looked for a vector database that could be embedded in the Go program, just like you would embed SQLite in order to not require any separate DB setup and maintenance. I was surprised when I didn't find any, given the abundance of embedded key-value stores in the Go ecosystem.
