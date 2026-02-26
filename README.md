@@ -143,6 +143,8 @@ Compared to the upstream baseline at commit `f63964a64bf64b261f665dd45f92cafadcb
   - chunk-based worker scheduling
   - per-worker top-k aggregation before final merge (less contention)
   - tuned concurrency heuristics based on document count and vector dimension
+  - cached document snapshots to reduce lock contention under high query concurrency
+  - pooled filtered-document slices to reduce query-time allocations
 - Runtime tuning knobs for query behavior:
   - `CHROMEM_QUERY_SMALL_DOCS_THRESHOLD`
   - `CHROMEM_QUERY_SEQUENTIAL_DOCS_THRESHOLD`
@@ -152,6 +154,8 @@ Compared to the upstream baseline at commit `f63964a64bf64b261f665dd45f92cafadcb
 - Optional SIMD path for dot product (amd64 + `GOEXPERIMENT=simd`) with runtime threshold control:
   - env var: `CHROMEM_SIMD_MIN_LENGTH`
   - API: `SetSIMDMinLength()`
+- Collection-level memory observability API:
+  - `Collection.MemoryStats()`
 - Reproducible benchmark workflow and matrix script:
   - `benchmark_matrix.ps1`
 
@@ -179,6 +183,24 @@ Additional SIMD-only dot-product check on `HEAD` (`-cpu=1`, `CHROMEM_SIMD_MIN_LE
 - `size=3072`: `-54.95%`
 
 You can reproduce the same comparison by running the benchmark commands in [Development](#development), then comparing outputs with `benchstat` or equivalent summary tooling.
+
+### High-concurrency snapshot (1GiB @ 1536 dims)
+
+Measured on this machine (`windows/amd64`, Intel i7-14700F) with SIMD enabled and ~1GiB embeddings-only corpus:
+
+```console
+go test -run ^$ -bench "^BenchmarkCollection_Query_NoContent_1536_Approx1GiB_ParallelLatencyMatrix$" -benchmem -benchtime=1x -count=1
+```
+
+Observed range:
+
+- workers=1: ~21.9 QPS, p50 ~45.5ms, p95 ~49.5ms
+- workers=4: ~26.5 QPS, p50 ~145.9ms, p95 ~205.0ms
+- workers=8: ~27.5 QPS, p50 ~254.8ms, p95 ~362.0ms
+- workers=16: ~25.9 QPS, p95 ~1010ms
+- workers=32: ~28.2 QPS, p95 ~1304ms
+
+Interpretation: throughput plateaus around 4-8 workers while tail latency rises rapidly beyond that.
 
 ## Features
 
@@ -210,6 +232,8 @@ You can reproduce the same comparison by running the benchmark commands in [Deve
   - [X] Optional immediate persistence (writes one file for each added collection and document, encoded as [gob](https://go.dev/blog/gob), optionally gzip-compressed)
   - [X] Backups: Export and import of the entire DB to/from a single file (encoded as [gob](https://go.dev/blog/gob), optionally gzip-compressed and AES-GCM encrypted)
     - Includes methods for generic `io.Writer`/`io.Reader` so you can plug S3 buckets and other blob storage, see [examples/s3-export-import](examples/s3-export-import) for example code
+- Observability:
+  - [X] Collection memory stats (`Collection.MemoryStats()`)
 - Data types:
   - [X] Documents (text)
 
@@ -355,13 +379,15 @@ The query path supports a SIMD-optimized dot product (Go `GOEXPERIMENT=simd`, AM
 
 - SIMD can be enabled for benchmarking via `GOEXPERIMENT=simd`.
 - The runtime threshold for switching from scalar to SIMD dot product can be configured with env var `CHROMEM_SIMD_MIN_LENGTH` or programmatically with `chromem.SetSIMDMinLength()`.
-- The default threshold is `1024`.
+- The default threshold is `1536`.
 
 Based on benchmark runs on Intel i7-14700F:
 
-- Dot product (`optimized`) is significantly faster for vectors `>= 1024` dimensions.
+- Dot product (`optimized`) is significantly faster for vectors `>= 1536` dimensions with the current defaults.
 - End-to-end query performance also improves, but gains are smaller than raw dot-product gains because filtering, heap maintenance, scheduling, and memory bandwidth become dominant.
-- A practical default is `CHROMEM_SIMD_MIN_LENGTH=1024` for balanced single-core and multi-core performance.
+- A practical default is `CHROMEM_SIMD_MIN_LENGTH=1536` for balanced single-core and multi-core performance on this hardware.
+
+For 1GiB / 1536-dim workloads, prefer running query concurrency around 4-8 workers for best throughput/latency tradeoff.
 
 #### Reproducible matrix benchmark
 

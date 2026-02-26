@@ -26,6 +26,7 @@ func TestFilterDocs(t *testing.T) {
 			Content:   "hallo welt",
 		},
 	}
+	docsSlice := []*Document{docs["1"], docs["2"]}
 
 	tt := []struct {
 		name          string
@@ -91,7 +92,10 @@ func TestFilterDocs(t *testing.T) {
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
-			got := filterDocs(docs, tc.where, tc.whereDocument)
+			got, shouldRelease := filterDocs(docsSlice, tc.where, tc.whereDocument)
+			if shouldRelease {
+				defer releaseDocumentSlice(got)
+			}
 
 			if !reflect.DeepEqual(got, tc.want) {
 				// If len is 2, the order might be different (function under test

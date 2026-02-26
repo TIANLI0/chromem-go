@@ -1,7 +1,6 @@
 package chromem
 
 import (
-	"errors"
 	"math"
 )
 
@@ -11,14 +10,14 @@ const isNormalizedPrecisionTolerance = 1e-6
 // It's the same as cosine similarity for normalized vectors.
 // The resulting value represents the similarity, so a higher value means the
 // vectors are more similar.
-func dotProduct(a, b []float32) (float32, error) {
-	// The vectors must have the same length
-	if len(a) != len(b) {
-		return 0, errors.New("vectors must have the same length")
-	}
+// func dotProduct(a, b []float32) (float32, error) {
+// 	// The vectors must have the same length
+// 	if len(a) != len(b) {
+// 		return 0, errors.New("vectors must have the same length")
+// 	}
 
-	return dotProductOptimized(a, b), nil
-}
+// 	return dotProductOptimized(a, b), nil
+// }
 
 func normalizeVector(v []float32) []float32 {
 	var norm float32

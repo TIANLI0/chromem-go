@@ -18,6 +18,8 @@ type Collection struct {
 
 	metadata      map[string]string
 	documents     map[string]*Document
+	documentsList []*Document
+	docsListValid bool
 	documentsLock sync.RWMutex
 	embed         EmbeddingFunc
 
@@ -274,6 +276,7 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 	c.documentsLock.Lock()
 	// We don't defer the unlock because we want to do it earlier.
 	c.documents[doc.ID] = &doc
+	c.docsListValid = false
 	c.documentsLock.Unlock()
 
 	// Persist the document
@@ -419,8 +422,11 @@ func (c *Collection) Delete(_ context.Context, where, whereDocument map[string]s
 
 	if where != nil || whereDocument != nil {
 		// metadata + content filters
-		filteredDocs := filterDocs(c.documents, where, whereDocument)
-		for _, doc := range filteredDocs {
+		docs := c.getDocumentsListLocked()
+		for _, doc := range docs {
+			if !documentMatchesFilters(doc, where, whereDocument) {
+				continue
+			}
 			docIDs = append(docIDs, doc.ID)
 		}
 	} else {
@@ -444,8 +450,41 @@ func (c *Collection) Delete(_ context.Context, where, whereDocument map[string]s
 			}
 		}
 	}
+	c.docsListValid = false
 
 	return nil
+}
+
+// getDocumentsListLocked returns a cached snapshot of all document pointers.
+// Caller must hold either documentsLock.RLock or documentsLock.Lock.
+func (c *Collection) getDocumentsListLocked() []*Document {
+	if c.docsListValid {
+		return c.documentsList
+	}
+
+	docs := make([]*Document, 0, len(c.documents))
+	for _, doc := range c.documents {
+		docs = append(docs, doc)
+	}
+
+	c.documentsList = docs
+	c.docsListValid = true
+	return c.documentsList
+}
+
+func (c *Collection) getDocumentsListSnapshot() []*Document {
+	c.documentsLock.RLock()
+	if c.docsListValid {
+		docs := c.documentsList
+		c.documentsLock.RUnlock()
+		return docs
+	}
+	c.documentsLock.RUnlock()
+
+	c.documentsLock.Lock()
+	docs := c.getDocumentsListLocked()
+	c.documentsLock.Unlock()
+	return docs
 }
 
 // Count returns the number of documents in the collection.
@@ -562,15 +601,6 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	if nResults <= 0 {
 		return nil, errors.New("nResults must be > 0")
 	}
-	c.documentsLock.RLock()
-	defer c.documentsLock.RUnlock()
-	if nResults > len(c.documents) {
-		return nil, errors.New("nResults must be <= the number of documents in the collection")
-	}
-
-	if len(c.documents) == 0 {
-		return nil, nil
-	}
 
 	// Validate whereDocument operators
 	for k := range whereDocument {
@@ -579,8 +609,23 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 		}
 	}
 
-	// Filter docs by metadata and content
-	filteredDocs := filterDocs(c.documents, where, whereDocument)
+	docs := c.getDocumentsListSnapshot()
+	if nResults > len(docs) {
+		return nil, errors.New("nResults must be <= the number of documents in the collection")
+	}
+
+	if len(docs) == 0 {
+		return nil, nil
+	}
+
+	filteredDocs := docs
+	shouldReleaseFilteredDocs := false
+	if len(where) > 0 || len(whereDocument) > 0 {
+		filteredDocs, shouldReleaseFilteredDocs = filterDocs(docs, where, whereDocument)
+	}
+	if shouldReleaseFilteredDocs {
+		defer releaseDocumentSlice(filteredDocs)
+	}
 
 	// No need to continue if the filters got rid of all documents
 	if len(filteredDocs) == 0 {

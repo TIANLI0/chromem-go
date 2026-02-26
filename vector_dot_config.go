@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 )
 
-const defaultDotProductSIMDMinLength = 1024
+const defaultDotProductSIMDMinLength = 1536 // 1536 is a heuristic based on benchmarks, but can be tuned via the environment variable CHROMEM_SIMD_MIN_LENGTH or the SetSIMDMinLength function.
 
 var dotProductSIMDMinLength atomic.Int64
 

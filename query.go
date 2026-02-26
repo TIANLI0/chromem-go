@@ -5,7 +5,6 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
-	"maps"
 	"runtime"
 	"slices"
 	"strings"
@@ -82,6 +81,25 @@ var documentSlicePool = sync.Pool{
 	},
 }
 
+const maxPooledDocumentSliceCapacity = 16_384
+
+// acquireDocumentSlice gets a slice of documents from the pool with at least the specified capacity.
+func acquireDocumentSlice(minCapacity int) []*Document {
+	s := documentSlicePool.Get().([]*Document)
+	if cap(s) < minCapacity {
+		return make([]*Document, 0, minCapacity)
+	}
+	return s[:0]
+}
+
+// releaseDocumentSlice returns a slice of documents to the pool if its capacity is within limits.
+func releaseDocumentSlice(s []*Document) {
+	if s == nil || cap(s) > maxPooledDocumentSliceCapacity {
+		return
+	}
+	documentSlicePool.Put(s[:0])
+}
+
 func queryConcurrency(numDocs int, vectorDim int) int {
 	if numDocs <= 0 {
 		return 0
@@ -117,40 +135,33 @@ func queryChunkSize(numDocs int) int {
 	}
 }
 
-func docsFromMap(docs map[string]*Document) []*Document {
-	return slices.Collect(maps.Values(docs))
-}
-
-// filterDocs filters a map of documents by metadata and content.
+// filterDocs filters a slice of documents by metadata and content.
 // It does this concurrently.
-func filterDocs(docs map[string]*Document, where, whereDocument map[string]string) []*Document {
+// The second return value indicates whether the returned slice should be released
+// with releaseDocumentSlice by the caller.
+func filterDocs(docs []*Document, where, whereDocument map[string]string) ([]*Document, bool) {
 	numDocs := len(docs)
 	concurrency := queryConcurrency(numDocs, 0)
 	if concurrency == 0 {
-		return nil
+		return nil, false
 	}
 
-	docsSlice := docsFromMap(docs)
-
 	if len(where) == 0 && len(whereDocument) == 0 {
-		return docsSlice
+		return docs, false
 	}
 
 	if concurrency == 1 || numDocs < getQuerySequentialDocsThreshold() {
-		filteredDocs := documentSlicePool.Get().([]*Document)
-		filteredDocs = filteredDocs[:0]
-		for _, doc := range docsSlice {
+		filteredDocs := acquireDocumentSlice(len(docs))
+		for _, doc := range docs {
 			if documentMatchesFilters(doc, where, whereDocument) {
 				filteredDocs = append(filteredDocs, doc)
 			}
 		}
 		if len(filteredDocs) == 0 {
-			documentSlicePool.Put(filteredDocs[:0])
-			return nil
+			releaseDocumentSlice(filteredDocs)
+			return nil, false
 		}
-		res := slices.Clone(filteredDocs)
-		documentSlicePool.Put(filteredDocs[:0])
-		return res
+		return filteredDocs, true
 	}
 
 	chunkSize := queryChunkSize(numDocs)
@@ -160,8 +171,7 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 	wg := sync.WaitGroup{}
 	for range concurrency {
 		wg.Go(func() {
-			localMatches := documentSlicePool.Get().([]*Document)
-			localMatches = localMatches[:0]
+			localMatches := acquireDocumentSlice(0)
 			for {
 				start := int(nextIndex.Add(int64(chunkSize)) - int64(chunkSize))
 				if start >= numDocs {
@@ -169,7 +179,7 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 				}
 
 				end := min(start+chunkSize, numDocs)
-				for _, doc := range docsSlice[start:end] {
+				for _, doc := range docs[start:end] {
 					if documentMatchesFilters(doc, where, whereDocument) {
 						localMatches = append(localMatches, doc)
 					}
@@ -182,18 +192,19 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 	wg.Wait()
 	close(resultsChan)
 
-	filteredDocs := make([]*Document, 0, numDocs)
+	filteredDocs := acquireDocumentSlice(numDocs)
 	for localMatches := range resultsChan {
 		filteredDocs = append(filteredDocs, localMatches...)
-		documentSlicePool.Put(localMatches[:0])
+		releaseDocumentSlice(localMatches)
 	}
 
 	// With filteredDocs being initialized as potentially large slice, let's return
 	// nil instead of the empty slice.
 	if len(filteredDocs) == 0 {
-		filteredDocs = nil
+		releaseDocumentSlice(filteredDocs)
+		return nil, false
 	}
-	return filteredDocs
+	return filteredDocs, true
 }
 
 // documentMatchesFilters checks if a document matches the given filters.
@@ -232,6 +243,11 @@ func documentMatchesFilters(document *Document, where, whereDocument map[string]
 
 func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []float32, negativeFilterThreshold float32, docs []*Document, n int) ([]docSim, error) {
 	numDocs := len(docs)
+	vectorDim := len(queryVectors)
+	if negativeFilterThreshold > 0 && len(negativeVector) != vectorDim {
+		return nil, fmt.Errorf("couldn't calculate negative similarity: vectors must have the same length")
+	}
+
 	concurrency := queryConcurrency(numDocs, len(queryVectors))
 	if concurrency == 0 {
 		return nil, nil
@@ -240,16 +256,13 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 	if concurrency == 1 || numDocs < getQuerySequentialDocsThreshold() {
 		localMaxDocs := newMaxDocSims(n)
 		for _, doc := range docs {
-			sim, err := dotProduct(queryVectors, doc.Embedding)
-			if err != nil {
-				return nil, fmt.Errorf("couldn't calculate similarity for document '%s': %w", doc.ID, err)
+			if len(doc.Embedding) != vectorDim {
+				return nil, fmt.Errorf("couldn't calculate similarity for document '%s': vectors must have the same length", doc.ID)
 			}
+			sim := dotProductOptimized(queryVectors, doc.Embedding)
 
 			if negativeFilterThreshold > 0 {
-				nsim, err := dotProduct(negativeVector, doc.Embedding)
-				if err != nil {
-					return nil, fmt.Errorf("couldn't calculate negative similarity for document '%s': %w", doc.ID, err)
-				}
+				nsim := dotProductOptimized(negativeVector, doc.Embedding)
 
 				if nsim > negativeFilterThreshold {
 					continue
@@ -304,18 +317,14 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 					}
 
 					// As the vectors are normalized, the dot product is the cosine similarity.
-					sim, err := dotProduct(queryVectors, doc.Embedding)
-					if err != nil {
-						setSharedErr(fmt.Errorf("couldn't calculate similarity for document '%s': %w", doc.ID, err))
+					if len(doc.Embedding) != vectorDim {
+						setSharedErr(fmt.Errorf("couldn't calculate similarity for document '%s': vectors must have the same length", doc.ID))
 						break
 					}
+					sim := dotProductOptimized(queryVectors, doc.Embedding)
 
 					if negativeFilterThreshold > 0 {
-						nsim, err := dotProduct(negativeVector, doc.Embedding)
-						if err != nil {
-							setSharedErr(fmt.Errorf("couldn't calculate negative similarity for document '%s': %w", doc.ID, err))
-							break
-						}
+						nsim := dotProductOptimized(negativeVector, doc.Embedding)
 
 						if nsim > negativeFilterThreshold {
 							continue

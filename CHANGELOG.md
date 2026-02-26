@@ -13,6 +13,11 @@ vNext
 - Added `Collection.ListIDs()` to list the IDs of all documents in a collection (PR [#105](https://github.com/philippgille/chromem-go/pull/105) by [@clocklear](https://github.com/clocklear))
   - Fixes issue [#103](https://github.com/philippgille/chromem-go/issues/103)
 - Added constant for `gemini-embedding-001` model (PR [#113](https://github.com/philippgille/chromem-go/pull/113) by [@scotteveritt](https://github.com/scotteveritt))
+- Added `Collection.MemoryStats()` for approximate collection memory usage and runtime heap observability.
+- Added 1536-dim ~1GiB benchmark scenarios and high-concurrency latency matrix benchmarks:
+  - `BenchmarkCollection_Query_NoContent_1536_Approx1GiB`
+  - `BenchmarkCollection_Query_NoContent_1536_Approx1GiB_Parallel`
+  - `BenchmarkCollection_Query_NoContent_1536_Approx1GiB_ParallelLatencyMatrix`
 
 ### Improved
 
@@ -26,6 +31,9 @@ vNext
   - `benchmark_matrix.ps1`
   - `rebuild_compare.ps1`
 - Added performance tuning guidance (SIMD + concurrency) and reproducible benchmark workflow to the README.
+- Improved query scalability under concurrency via cached document snapshots and reduced lock contention in `QueryEmbedding`.
+- Reduced query-time allocations by switching filter internals from map-based to slice-based pooled processing.
+- Updated SIMD threshold guidance to `1536` and documented high-concurrency tradeoffs for 1536-dim ~1GiB workloads.
 
 v0.7.0 (2024-09-01)
 -------------------

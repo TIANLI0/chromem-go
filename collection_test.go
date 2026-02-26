@@ -3,11 +3,16 @@ package chromem
 import (
 	"context"
 	"errors"
+	"math"
 	"math/rand"
 	"os"
 	"slices"
+	"sort"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestCollection_Add(t *testing.T) {
@@ -868,6 +873,23 @@ func TestMakePartialDocument(t *testing.T) {
 // Global var for assignment in the benchmark to avoid compiler optimizations.
 var globalRes []Result
 
+const benchmarkTargetEmbeddingBytes1GiB uint64 = 1 << 30
+
+func benchmarkDocCountForEmbeddingBytes(dim int, bytes uint64) int {
+	if dim <= 0 {
+		return 0
+	}
+	bytesPerDoc := uint64(dim * 4)
+	if bytesPerDoc == 0 {
+		return 0
+	}
+	n := bytes / bytesPerDoc
+	if bytes%bytesPerDoc != 0 {
+		n++
+	}
+	return int(n)
+}
+
 func BenchmarkCollection_Query_NoContent_100(b *testing.B) {
 	benchmarkCollection_Query(b, 100, false)
 }
@@ -886,6 +908,159 @@ func BenchmarkCollection_Query_NoContent_25000(b *testing.B) {
 
 func BenchmarkCollection_Query_NoContent_100000(b *testing.B) {
 	benchmarkCollection_Query(b, 100_000, false)
+}
+
+func BenchmarkCollection_Query_NoContent_1536_Approx1GiB(b *testing.B) {
+	n := benchmarkDocCountForEmbeddingBytes(1536, benchmarkTargetEmbeddingBytes1GiB)
+	benchmarkCollection_Query_EmbeddingOnly(b, n, 1536)
+}
+
+func BenchmarkCollection_Query_NoContent_1536_Approx1GiB_Parallel(b *testing.B) {
+	n := benchmarkDocCountForEmbeddingBytes(1536, benchmarkTargetEmbeddingBytes1GiB)
+	benchmarkCollection_Query_EmbeddingOnlyParallel(b, n, 1536)
+}
+
+func BenchmarkCollection_Query_NoContent_1536_Approx1GiB_ParallelLatencyMatrix(b *testing.B) {
+	n := benchmarkDocCountForEmbeddingBytes(1536, benchmarkTargetEmbeddingBytes1GiB)
+
+	ctx := context.Background()
+	r := rand.New(rand.NewSource(42))
+	d := 1536
+
+	qv := make([]float32, d)
+	for j := range d {
+		qv[j] = r.Float32()
+	}
+	qv = normalizeVector(qv)
+
+	db := NewDB()
+	name := "test"
+	embeddingFunc := func(_ context.Context, text string) ([]float32, error) {
+		return nil, errors.New("embedding func not expected to be called")
+	}
+	c, err := db.CreateCollection(name, nil, embeddingFunc)
+	if err != nil {
+		b.Fatal("expected no error, got", err)
+	}
+
+	for i := range n {
+		v := make([]float32, d)
+		for j := range d {
+			v[j] = r.Float32()
+		}
+		v = normalizeVector(v)
+
+		doc := Document{ID: strconv.Itoa(i), Embedding: v}
+		if err := c.AddDocument(ctx, doc); err != nil {
+			b.Fatal("expected nil, got", err)
+		}
+	}
+
+	stats := c.MemoryStats()
+	b.ReportMetric(float64(stats.ApproxEmbeddingBytes)/(1024*1024), "embedMiB")
+	b.ReportMetric(float64(stats.RuntimeHeapInuse)/(1024*1024), "heapInuseMiB")
+
+	workerLevels := []int{1, 4, 8, 16, 32}
+	for _, workers := range workerLevels {
+		b.Run("workers="+strconv.Itoa(workers), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				result, runErr := runParallelQueryLatencyWindow(ctx, c, qv, workers, time.Second)
+				if runErr != nil {
+					b.Fatal(runErr)
+				}
+				b.ReportMetric(result.QPS, "qps")
+				b.ReportMetric(result.P50Ms, "p50_ms")
+				b.ReportMetric(result.P95Ms, "p95_ms")
+				b.ReportMetric(result.P99Ms, "p99_ms")
+				b.ReportMetric(float64(result.TotalQueries), "queries")
+			}
+		})
+	}
+}
+
+type parallelLatencyResult struct {
+	TotalQueries int64
+	QPS          float64
+	P50Ms        float64
+	P95Ms        float64
+	P99Ms        float64
+}
+
+func runParallelQueryLatencyWindow(ctx context.Context, c *Collection, qv []float32, workers int, duration time.Duration) (parallelLatencyResult, error) {
+	deadline := time.Now().Add(duration)
+
+	var totalQueries atomic.Int64
+	latencies := make([]int64, 0, workers*128)
+	latenciesLock := sync.Mutex{}
+
+	errCh := make(chan error, 1)
+	startCh := make(chan struct{})
+	wg := sync.WaitGroup{}
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startCh
+
+			for time.Now().Before(deadline) {
+				start := time.Now()
+				_, err := c.QueryEmbedding(ctx, qv, 10, nil, nil)
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+
+				latencyNs := time.Since(start).Nanoseconds()
+				latenciesLock.Lock()
+				latencies = append(latencies, latencyNs)
+				latenciesLock.Unlock()
+				totalQueries.Add(1)
+			}
+		}()
+	}
+
+	windowStart := time.Now()
+	close(startCh)
+	wg.Wait()
+	elapsed := time.Since(windowStart)
+
+	select {
+	case err := <-errCh:
+		return parallelLatencyResult{}, err
+	default:
+	}
+
+	if len(latencies) == 0 {
+		return parallelLatencyResult{}, errors.New("no latencies recorded in benchmark window")
+	}
+
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	qps := float64(totalQueries.Load()) / elapsed.Seconds()
+
+	return parallelLatencyResult{
+		TotalQueries: totalQueries.Load(),
+		QPS:          qps,
+		P50Ms:        percentileLatencyMs(latencies, 0.50),
+		P95Ms:        percentileLatencyMs(latencies, 0.95),
+		P99Ms:        percentileLatencyMs(latencies, 0.99),
+	}, nil
+}
+
+func percentileLatencyMs(sortedNs []int64, percentile float64) float64 {
+	if len(sortedNs) == 0 {
+		return 0
+	}
+	idx := int(math.Ceil(percentile*float64(len(sortedNs)))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sortedNs) {
+		idx = len(sortedNs) - 1
+	}
+	return float64(sortedNs[idx]) / 1e6
 }
 
 func BenchmarkCollection_Query_100(b *testing.B) {
@@ -976,6 +1151,120 @@ func benchmarkCollection_Query(b *testing.B, n int, withContent bool) {
 		b.Fatal("expected nil, got", err)
 	}
 	globalRes = res
+}
+
+func benchmarkCollection_Query_EmbeddingOnly(b *testing.B, n int, d int) {
+	ctx := context.Background()
+
+	r := rand.New(rand.NewSource(42))
+
+	qv := make([]float32, d)
+	for j := range d {
+		qv[j] = r.Float32()
+	}
+	qv = normalizeVector(qv)
+
+	db := NewDB()
+	name := "test"
+	embeddingFunc := func(_ context.Context, text string) ([]float32, error) {
+		return nil, errors.New("embedding func not expected to be called")
+	}
+	c, err := db.CreateCollection(name, nil, embeddingFunc)
+	if err != nil {
+		b.Fatal("expected no error, got", err)
+	}
+	if c == nil {
+		b.Fatal("expected collection, got nil")
+	}
+
+	for i := range n {
+		v := make([]float32, d)
+		for j := range d {
+			v[j] = r.Float32()
+		}
+		v = normalizeVector(v)
+
+		doc := Document{
+			ID:        strconv.Itoa(i),
+			Embedding: v,
+		}
+
+		if err := c.AddDocument(ctx, doc); err != nil {
+			b.Fatal("expected nil, got", err)
+		}
+	}
+
+	stats := c.MemoryStats()
+	b.ReportMetric(float64(stats.ApproxEmbeddingBytes)/(1024*1024), "embedMiB")
+	b.ReportMetric(float64(stats.RuntimeHeapInuse)/(1024*1024), "heapInuseMiB")
+
+	b.ResetTimer()
+
+	var res []Result
+	for i := 0; i < b.N; i++ {
+		res, err = c.QueryEmbedding(ctx, qv, 10, nil, nil)
+	}
+	if err != nil {
+		b.Fatal("expected nil, got", err)
+	}
+	globalRes = res
+}
+
+func benchmarkCollection_Query_EmbeddingOnlyParallel(b *testing.B, n int, d int) {
+	ctx := context.Background()
+
+	r := rand.New(rand.NewSource(42))
+
+	qv := make([]float32, d)
+	for j := range d {
+		qv[j] = r.Float32()
+	}
+	qv = normalizeVector(qv)
+
+	db := NewDB()
+	name := "test"
+	embeddingFunc := func(_ context.Context, text string) ([]float32, error) {
+		return nil, errors.New("embedding func not expected to be called")
+	}
+	c, err := db.CreateCollection(name, nil, embeddingFunc)
+	if err != nil {
+		b.Fatal("expected no error, got", err)
+	}
+	if c == nil {
+		b.Fatal("expected collection, got nil")
+	}
+
+	for i := range n {
+		v := make([]float32, d)
+		for j := range d {
+			v[j] = r.Float32()
+		}
+		v = normalizeVector(v)
+
+		doc := Document{
+			ID:        strconv.Itoa(i),
+			Embedding: v,
+		}
+
+		if err := c.AddDocument(ctx, doc); err != nil {
+			b.Fatal("expected nil, got", err)
+		}
+	}
+
+	stats := c.MemoryStats()
+	b.ReportMetric(float64(stats.ApproxEmbeddingBytes)/(1024*1024), "embedMiB")
+	b.ReportMetric(float64(stats.RuntimeHeapInuse)/(1024*1024), "heapInuseMiB")
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			res, queryErr := c.QueryEmbedding(ctx, qv, 10, nil, nil)
+			if queryErr != nil {
+				b.Fatal("expected nil, got", queryErr)
+			}
+			globalRes = res
+		}
+	})
 }
 
 var globalDoc *Document
