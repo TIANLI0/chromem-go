@@ -1,17 +1,19 @@
 # chromem-go
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/philippgille/chromem-go.svg)](https://pkg.go.dev/github.com/philippgille/chromem-go)
-[![Build status](https://github.com/philippgille/chromem-go/actions/workflows/go.yml/badge.svg)](https://github.com/philippgille/chromem-go/actions/workflows/go.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/philippgille/chromem-go)](https://goreportcard.com/report/github.com/philippgille/chromem-go)
-[![GitHub Releases](https://img.shields.io/github/release/philippgille/chromem-go.svg)](https://github.com/philippgille/chromem-go/releases)
+[![Go Reference](https://pkg.go.dev/badge/github.com/TIANLI0/chromem-go.svg)](https://pkg.go.dev/github.com/TIANLI0/chromem-go)
+[![Build status](https://github.com/TIANLI0/chromem-go/actions/workflows/go.yml/badge.svg)](https://github.com/TIANLI0/chromem-go/actions/workflows/go.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/TIANLI0/chromem-go)](https://goreportcard.com/report/github.com/TIANLI0/chromem-go)
+[![GitHub Releases](https://img.shields.io/github/release/TIANLI0/chromem-go.svg)](https://github.com/TIANLI0/chromem-go/releases)
 
 Embeddable vector database for Go with Chroma-like interface and zero third-party dependencies. In-memory with optional persistence.
+
+This repository is a performance-focused fork of the original project at <https://github.com/philippgille/chromem-go>.
 
 Because `chromem-go` is embeddable it enables you to add retrieval augmented generation (RAG) and similar embeddings-based features into your Go app *without having to run a separate database*. Like when using SQLite instead of PostgreSQL/MySQL/etc.
 
 It's *not* a library to connect to Chroma and also not a reimplementation of it in Go. It's a database on its own.
 
-The focus is not scale (millions of documents) or number of features, but simplicity and performance for the most common use cases. On a mid-range 2020 Intel laptop CPU you can query 1,000 documents in 0.3 ms and 100,000 documents in 40 ms, with very few and small memory allocations. See [Benchmarks](#benchmarks) for details.
+The focus is not scale (millions of documents) or number of features, but simplicity and performance for the most common use cases. This fork adds post-`f63964a64bf64b261f665dd45f92cafadcb0b972` query-path optimizations and SIMD controls; see [Differences vs upstream (after `f63964a`)](#differences-vs-upstream-after-f63964a) and [Benchmarks](#benchmarks).
 
 > ⚠️ The project is in beta, under heavy construction, and may introduce breaking changes in releases before `v1.0.0`. All changes are documented in the [`CHANGELOG`](./CHANGELOG.md).
 
@@ -19,13 +21,14 @@ The focus is not scale (millions of documents) or number of features, but simpli
 
 1. [Use cases](#use-cases)
 2. [Interface](#interface)
-3. [Features + Roadmap](#features)
-4. [Installation](#installation)
-5. [Usage](#usage)
-6. [Benchmarks](#benchmarks)
-7. [Development](#development)
-8. [Motivation](#motivation)
-9. [Related projects](#related-projects)
+3. [Differences vs upstream (after `f63964a`)](#differences-vs-upstream-after-f63964a)
+4. [Features + Roadmap](#features)
+5. [Installation](#installation)
+6. [Usage](#usage)
+7. [Benchmarks](#benchmarks)
+8. [Development](#development)
+9. [Motivation](#motivation)
+10. [Related projects](#related-projects)
 
 ## Use cases
 
@@ -95,7 +98,7 @@ Our Go library exposes the same interface:
 ```go
 package main
 
-import "github.com/philippgille/chromem-go"
+import "github.com/TIANLI0/chromem-go"
 
 func main() {
     // Set up chromem-go in-memory, for easy prototyping. Can add persistence easily!
@@ -130,7 +133,52 @@ func main() {
 Initially `chromem-go` started with just the four core methods, but we added more over time. We intentionally don't want to cover 100% of Chroma's API surface though.  
 We're providing some alternative methods that are more Go-idiomatic instead.
 
-For the full interface see the Godoc: <https://pkg.go.dev/github.com/philippgille/chromem-go>
+For the full interface see the Godoc: <https://pkg.go.dev/github.com/TIANLI0/chromem-go>
+
+## Differences vs upstream (after `f63964a`)
+
+Compared to the upstream baseline at commit `f63964a64bf64b261f665dd45f92cafadcb0b972`, this fork currently includes:
+
+- Query execution internals reworked for lower latency:
+  - chunk-based worker scheduling
+  - per-worker top-k aggregation before final merge (less contention)
+  - tuned concurrency heuristics based on document count and vector dimension
+- Runtime tuning knobs for query behavior:
+  - `CHROMEM_QUERY_SMALL_DOCS_THRESHOLD`
+  - `CHROMEM_QUERY_SEQUENTIAL_DOCS_THRESHOLD`
+  - `CHROMEM_QUERY_HIGH_DIM_THRESHOLD`
+  - `CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR`
+  - plus matching setter APIs (`SetQuery...`)
+- Optional SIMD path for dot product (amd64 + `GOEXPERIMENT=simd`) with runtime threshold control:
+  - env var: `CHROMEM_SIMD_MIN_LENGTH`
+  - API: `SetSIMDMinLength()`
+- Reproducible benchmark workflow and matrix script:
+  - `benchmark_matrix.ps1`
+
+### Performance snapshot vs `f63964a`
+
+Measured on this machine (`windows/amd64`, Intel i7-14700F), with:
+
+```console
+go test -run=^$ -bench "BenchmarkCollection_Query_NoContent_(1000|5000|25000|100000)$|BenchmarkDotProduct" -benchmem -benchtime=200ms -count=4 ./...
+```
+
+Average query latency (`ns/op`) improved versus `f63964a`:
+
+- `1000` docs: `-56.33%`
+- `5000` docs: `-68.95%`
+- `25000` docs: `-42.94%`
+- `100000` docs: `-38.61%`
+
+At the same time, memory overhead increased for these scenarios (`B/op`, `allocs/op`), which is a deliberate speed/overhead trade-off in the current implementation.
+
+Additional SIMD-only dot-product check on `HEAD` (`-cpu=1`, `CHROMEM_SIMD_MIN_LENGTH=0`) shows `optimized` path gains over no-SIMD build:
+
+- `size=1024`: `-35.78%`
+- `size=1536`: `-38.79%`
+- `size=3072`: `-54.95%`
+
+You can reproduce the same comparison by running the benchmark commands in [Development](#development), then comparing outputs with `benchstat` or equivalent summary tooling.
 
 ## Features
 
@@ -150,7 +198,7 @@ For the full interface see the Godoc: <https://pkg.go.dev/github.com/philippgill
   - Local:
     - [X] [Ollama](https://github.com/ollama/ollama)
     - [X] [LocalAI](https://github.com/mudler/LocalAI)
-  - Bring your own (implement [`chromem.EmbeddingFunc`](https://pkg.go.dev/github.com/philippgille/chromem-go#EmbeddingFunc))
+  - Bring your own (implement [`chromem.EmbeddingFunc`](https://pkg.go.dev/github.com/TIANLI0/chromem-go#EmbeddingFunc))
   - You can also pass existing embeddings when adding documents to a collection, instead of letting `chromem-go` create them
 - Similarity search:
   - [X] Exhaustive nearest neighbor search using cosine similarity (sometimes also called exact search or brute-force search or FLAT index)
@@ -168,7 +216,7 @@ For the full interface see the Godoc: <https://pkg.go.dev/github.com/philippgill
 ### Roadmap
 
 - Performance:
-  - Use SIMD for dot product calculation on supported CPUs (draft PR: [#48](https://github.com/philippgille/chromem-go/pull/48))
+  - Further tune SIMD thresholds and defaults across CPU architectures
   - Add [roaring bitmaps](https://github.com/RoaringBitmap/roaring) to speed up full text filtering
 - Embedding creators:
   - Add an `EmbeddingFunc` that downloads and shells out to [llamafile](https://github.com/Mozilla-Ocho/llamafile)
@@ -188,11 +236,15 @@ For the full interface see the Godoc: <https://pkg.go.dev/github.com/philippgill
 
 ## Installation
 
+`go get github.com/TIANLI0/chromem-go@latest`
+
+If you want the original upstream instead of this fork, use:
+
 `go get github.com/philippgille/chromem-go@latest`
 
 ## Usage
 
-See the Godoc for a reference: <https://pkg.go.dev/github.com/philippgille/chromem-go>
+See the Godoc for a reference: <https://pkg.go.dev/github.com/TIANLI0/chromem-go>
 
 For full, working examples, using the vector database for retrieval augmented generation (RAG) and semantic search and using either OpenAI or locally running the embeddings model and LLM (in Ollama), see the [example code](examples).
 
@@ -208,7 +260,7 @@ import (
  "fmt"
  "runtime"
 
- "github.com/philippgille/chromem-go"
+ "github.com/TIANLI0/chromem-go"
 )
 
 func main() {
