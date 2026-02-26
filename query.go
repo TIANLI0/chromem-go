@@ -14,7 +14,7 @@ import (
 var supportedFilters = []string{"$contains", "$not_contains"}
 
 type docSim struct {
-	docID      string
+	doc        *Document
 	similarity float32
 }
 
@@ -41,11 +41,9 @@ func (h *docMaxHeap) Pop() any {
 }
 
 // maxDocSims manages a max-heap of docSims with a fixed size, keeping the n highest
-// similarities. It's safe for concurrent use, but not the result of values().
-// In our benchmarks this was faster than sorting a slice of docSims at the end.
+// similarities. It's not safe for concurrent use.
 type maxDocSims struct {
 	h    docMaxHeap
-	lock sync.RWMutex
 	size int
 }
 
@@ -59,8 +57,6 @@ func newMaxDocSims(size int) *maxDocSims {
 
 // add inserts a new docSim into the heap, keeping only the top n similarities.
 func (d *maxDocSims) add(doc docSim) {
-	d.lock.Lock()
-	defer d.lock.Unlock()
 	if d.h.Len() < d.size {
 		heap.Push(&d.h, doc)
 	} else if d.h.Len() > 0 && d.h[0].similarity < doc.similarity {
@@ -71,41 +67,56 @@ func (d *maxDocSims) add(doc docSim) {
 }
 
 // values returns the docSims in the heap, sorted by similarity (descending).
-// The call itself is safe for concurrent use with add(), but the result isn't.
-// Only work with the result after all calls to add() have finished.
 func (d *maxDocSims) values() []docSim {
-	d.lock.RLock()
-	defer d.lock.RUnlock()
 	slices.SortFunc(d.h, func(i, j docSim) int {
 		return cmp.Compare(j.similarity, i.similarity)
 	})
 	return d.h
 }
 
+func queryConcurrency(numDocs int) int {
+	if numDocs <= 0 {
+		return 0
+	}
+
+	numCPUs := runtime.NumCPU()
+	if numCPUs <= 1 {
+		return 1
+	}
+
+	concurrency := numCPUs / 2
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	return min(numDocs, concurrency)
+}
+
 // filterDocs filters a map of documents by metadata and content.
 // It does this concurrently.
 func filterDocs(docs map[string]*Document, where, whereDocument map[string]string) []*Document {
-	filteredDocs := make([]*Document, 0, len(docs))
-	filteredDocsLock := sync.Mutex{}
-
-	// Determine concurrency. Use number of docs or CPUs, whichever is smaller.
-	numCPUs := runtime.NumCPU()
 	numDocs := len(docs)
-	concurrency := min(numDocs, numCPUs)
+	concurrency := queryConcurrency(numDocs)
+	if concurrency == 0 {
+		return nil
+	}
 
 	docChan := make(chan *Document, concurrency*2)
+	resultsChan := make(chan []*Document, concurrency)
 
 	wg := sync.WaitGroup{}
 	for range concurrency {
-		wg.Go(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			localMatches := make([]*Document, 0, numDocs/concurrency+1)
 			for doc := range docChan {
 				if documentMatchesFilters(doc, where, whereDocument) {
-					filteredDocsLock.Lock()
-					filteredDocs = append(filteredDocs, doc)
-					filteredDocsLock.Unlock()
+					localMatches = append(localMatches, doc)
 				}
 			}
-		})
+			resultsChan <- localMatches
+		}()
 	}
 
 	for _, doc := range docs {
@@ -114,6 +125,12 @@ func filterDocs(docs map[string]*Document, where, whereDocument map[string]strin
 	close(docChan)
 
 	wg.Wait()
+	close(resultsChan)
+
+	filteredDocs := make([]*Document, 0, len(docs))
+	for localMatches := range resultsChan {
+		filteredDocs = append(filteredDocs, localMatches...)
+	}
 
 	// With filteredDocs being initialized as potentially large slice, let's return
 	// nil instead of the empty slice.
@@ -158,12 +175,11 @@ func documentMatchesFilters(document *Document, where, whereDocument map[string]
 }
 
 func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []float32, negativeFilterThreshold float32, docs []*Document, n int) ([]docSim, error) {
-	nMaxDocs := newMaxDocSims(n)
-
-	// Determine concurrency. Use number of docs or CPUs, whichever is smaller.
-	numCPUs := runtime.NumCPU()
 	numDocs := len(docs)
-	concurrency := min(numDocs, numCPUs)
+	concurrency := queryConcurrency(numDocs)
+	if concurrency == 0 {
+		return nil, nil
+	}
 
 	var sharedErr error
 	sharedErrLock := sync.Mutex{}
@@ -181,6 +197,7 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 	}
 
 	wg := sync.WaitGroup{}
+	workerResults := make([][]docSim, concurrency)
 	// Instead of using a channel to pass documents into the goroutines, we just
 	// split the slice into sub-slices and pass those to the goroutines.
 	// This turned out to be faster in the query benchmarks.
@@ -195,8 +212,9 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 		}
 
 		wg.Add(1)
-		go func(subSlice []*Document) {
+		go func(workerIndex int, subSlice []*Document) {
 			defer wg.Done()
+			localMaxDocs := newMaxDocSims(n)
 			for _, doc := range subSlice {
 				// Stop work if another goroutine encountered an error.
 				if ctx.Err() != nil {
@@ -222,15 +240,23 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 					}
 				}
 
-				nMaxDocs.add(docSim{docID: doc.ID, similarity: sim})
+				localMaxDocs.add(docSim{doc: doc, similarity: sim})
 			}
-		}(docs[start:end])
+			workerResults[workerIndex] = localMaxDocs.values()
+		}(i, docs[start:end])
 	}
 
 	wg.Wait()
 
 	if sharedErr != nil {
 		return nil, sharedErr
+	}
+
+	nMaxDocs := newMaxDocSims(n)
+	for _, workerTopK := range workerResults {
+		for _, doc := range workerTopK {
+			nMaxDocs.add(doc)
+		}
 	}
 
 	return nMaxDocs.values(), nil

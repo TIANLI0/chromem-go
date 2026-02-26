@@ -605,11 +605,12 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 
 	res := make([]Result, 0, len(nMaxDocs))
 	for i := range nMaxDocs {
+		doc := nMaxDocs[i].doc
 		res = append(res, Result{
-			ID:         nMaxDocs[i].docID,
-			Metadata:   c.documents[nMaxDocs[i].docID].Metadata,
-			Embedding:  c.documents[nMaxDocs[i].docID].Embedding,
-			Content:    c.documents[nMaxDocs[i].docID].Content,
+			ID:         doc.ID,
+			Metadata:   doc.Metadata,
+			Embedding:  doc.Embedding,
+			Content:    doc.Content,
 			Similarity: nMaxDocs[i].similarity,
 		})
 	}
