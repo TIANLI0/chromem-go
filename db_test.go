@@ -68,6 +68,257 @@ func TestNewPersistentDB_Errors(t *testing.T) {
 	})
 }
 
+func TestNewPersistentDBWithOptions_LazyLoadPayload(t *testing.T) {
+	ctx := context.Background()
+	path, err := os.MkdirTemp(os.TempDir(), "chromem-go-lazy")
+	if err != nil {
+		t.Fatal("couldn't create temp dir:", err)
+	}
+	defer os.RemoveAll(path)
+
+	makeEmbed := func(_ context.Context, _ string) ([]float32, error) {
+		return []float32{1, 0}, nil
+	}
+
+	db, err := NewPersistentDB(path, false)
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	c, err := db.CreateCollection("lazy-test", nil, makeEmbed)
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	err = c.AddDocument(ctx, Document{
+		ID:        "1",
+		Metadata:  map[string]string{"lang": "en"},
+		Embedding: []float32{1, 0},
+		Content:   "hello lazy world",
+	})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	dbLazy, err := NewPersistentDBWithOptions(path, PersistentDBOptions{Compress: false, LazyLoadPayload: true})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	cLazy := dbLazy.GetCollection("lazy-test", makeEmbed)
+	if cLazy == nil {
+		t.Fatal("expected collection, got nil")
+	}
+
+	docPtr, ok := cLazy.documents["1"]
+	if !ok {
+		t.Fatal("expected document to exist")
+	}
+	if !reflect.DeepEqual(docPtr.Metadata, map[string]string(nil)) {
+		t.Fatalf("expected metadata to be unloaded, got %#v", docPtr.Metadata)
+	}
+	if docPtr.Content != "" {
+		t.Fatalf("expected content to be unloaded, got %q", docPtr.Content)
+	}
+	if docPtr.payloadLoaded {
+		t.Fatal("expected payloadLoaded=false after lazy startup")
+	}
+
+	res, err := cLazy.QueryEmbedding(ctx, []float32{1, 0}, 1, nil, nil)
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(res))
+	}
+	if res[0].Content != "hello lazy world" {
+		t.Fatalf("expected content to be loaded on demand, got %q", res[0].Content)
+	}
+
+	if !docPtr.payloadLoaded {
+		t.Fatal("expected payloadLoaded=true after on-demand read")
+	}
+}
+
+func TestNewPersistentDBWithOptions_LazyLoadPayload_Export(t *testing.T) {
+	ctx := context.Background()
+	path, err := os.MkdirTemp(os.TempDir(), "chromem-go-lazy-export")
+	if err != nil {
+		t.Fatal("couldn't create temp dir:", err)
+	}
+	defer os.RemoveAll(path)
+
+	db, err := NewPersistentDB(path, false)
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	c, err := db.CreateCollection("lazy-export", nil, func(_ context.Context, _ string) ([]float32, error) {
+		return []float32{1, 0}, nil
+	})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	err = c.AddDocument(ctx, Document{
+		ID:        "d1",
+		Metadata:  map[string]string{"k": "v"},
+		Embedding: []float32{1, 0},
+		Content:   "persist me",
+	})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	dbLazy, err := NewPersistentDBWithOptions(path, PersistentDBOptions{Compress: false, LazyLoadPayload: true})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	exportPath := filepath.Join(path, "export.gob")
+	err = dbLazy.ExportToFile(exportPath, false, "")
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	imported := NewDB()
+	err = imported.ImportFromFile(exportPath, "")
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	importedCollection := imported.GetCollection("lazy-export", nil)
+	if importedCollection == nil {
+		t.Fatal("expected imported collection, got nil")
+	}
+	doc, err := importedCollection.GetByID(ctx, "d1")
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	if doc.Content != "persist me" {
+		t.Fatalf("expected content %q, got %q", "persist me", doc.Content)
+	}
+	if doc.Metadata["k"] != "v" {
+		t.Fatalf("expected metadata k=v, got %#v", doc.Metadata)
+	}
+}
+
+func TestNewPersistentDBWithOptions_StreamEmbeddingsOnQuery(t *testing.T) {
+	ctx := context.Background()
+	path, err := os.MkdirTemp(os.TempDir(), "chromem-go-stream-embed")
+	if err != nil {
+		t.Fatal("couldn't create temp dir:", err)
+	}
+	defer os.RemoveAll(path)
+
+	db, err := NewPersistentDB(path, false)
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	c, err := db.CreateCollection("stream-embed", nil, func(_ context.Context, _ string) ([]float32, error) {
+		return []float32{1, 0}, nil
+	})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	err = c.AddDocument(ctx, Document{
+		ID:        "d1",
+		Metadata:  map[string]string{"k": "v"},
+		Embedding: []float32{1, 0},
+		Content:   "stream me",
+	})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	dbStream, err := NewPersistentDBWithOptions(path, PersistentDBOptions{Compress: false, LazyLoadPayload: true, StreamEmbeddingsOnQuery: true})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	cStream := dbStream.GetCollection("stream-embed", nil)
+	if cStream == nil {
+		t.Fatal("expected collection, got nil")
+	}
+	docPtr := cStream.documents["d1"]
+	if docPtr == nil {
+		t.Fatal("expected document, got nil")
+	}
+	if len(docPtr.Embedding) != 0 {
+		t.Fatalf("expected embedding unloaded at startup, got len=%d", len(docPtr.Embedding))
+	}
+
+	res, err := cStream.QueryEmbedding(ctx, []float32{1, 0}, 1, nil, nil)
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(res))
+	}
+	if len(res[0].Embedding) != 2 {
+		t.Fatalf("expected embedding in query result, got len=%d", len(res[0].Embedding))
+	}
+	if res[0].Content != "stream me" {
+		t.Fatalf("expected content to be loaded on demand, got %q", res[0].Content)
+	}
+}
+
+func TestNewPersistentDBWithOptions_StreamEmbeddingsOnQuery_Export(t *testing.T) {
+	ctx := context.Background()
+	path, err := os.MkdirTemp(os.TempDir(), "chromem-go-stream-export")
+	if err != nil {
+		t.Fatal("couldn't create temp dir:", err)
+	}
+	defer os.RemoveAll(path)
+
+	db, err := NewPersistentDB(path, false)
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	c, err := db.CreateCollection("stream-export", nil, func(_ context.Context, _ string) ([]float32, error) {
+		return []float32{1, 0}, nil
+	})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	err = c.AddDocument(ctx, Document{
+		ID:        "d1",
+		Metadata:  map[string]string{"k": "v"},
+		Embedding: []float32{1, 0},
+		Content:   "export me",
+	})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	dbStream, err := NewPersistentDBWithOptions(path, PersistentDBOptions{Compress: false, LazyLoadPayload: true, StreamEmbeddingsOnQuery: true})
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	exportPath := filepath.Join(path, "stream_export.gob")
+	err = dbStream.ExportToFile(exportPath, false, "")
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	imported := NewDB()
+	err = imported.ImportFromFile(exportPath, "")
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+
+	importedCollection := imported.GetCollection("stream-export", nil)
+	if importedCollection == nil {
+		t.Fatal("expected imported collection, got nil")
+	}
+	doc, err := importedCollection.GetByID(ctx, "d1")
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	if len(doc.Embedding) != 2 {
+		t.Fatalf("expected exported/imported embedding len=2, got %d", len(doc.Embedding))
+	}
+	if doc.Content != "export me" {
+		t.Fatalf("expected content %q, got %q", "export me", doc.Content)
+	}
+}
+
 func TestDB_ImportExport(t *testing.T) {
 	r := rand.New(rand.NewSource(rand.Int63()))
 	randString := randomPathComponent(r, 10)

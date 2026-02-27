@@ -23,8 +23,9 @@ type Collection struct {
 	documentsLock sync.RWMutex
 	embed         EmbeddingFunc
 
-	persistDirectory string
-	compress         bool
+	persistDirectory        string
+	compress                bool
+	streamEmbeddingsOnQuery bool
 
 	// ⚠️ When adding fields here, consider adding them to the persistence struct
 	// versions in [DB.Export] and [DB.Import] as well!
@@ -93,7 +94,7 @@ type NegativeQueryOptions struct {
 
 // We don't export this yet to keep the API surface to the bare minimum.
 // Users create collections via [Client.CreateCollection].
-func newCollection(name string, metadata map[string]string, embed EmbeddingFunc, dbDir string, compress bool) (*Collection, error) {
+func newCollection(name string, metadata map[string]string, embed EmbeddingFunc, dbDir string, compress bool, streamEmbeddingsOnQuery bool) (*Collection, error) {
 	// We copy the metadata to avoid data races in case the caller modifies the
 	// map after creating the collection while we range over it.
 	m := make(map[string]string, len(metadata))
@@ -102,9 +103,10 @@ func newCollection(name string, metadata map[string]string, embed EmbeddingFunc,
 	c := &Collection{
 		Name: name,
 
-		metadata:  m,
-		documents: make(map[string]*Document),
-		embed:     embed,
+		metadata:                m,
+		documents:               make(map[string]*Document),
+		embed:                   embed,
+		streamEmbeddingsOnQuery: streamEmbeddingsOnQuery,
 	}
 
 	// Persistence
@@ -274,6 +276,10 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 	}
 
 	c.documentsLock.Lock()
+	doc.payloadLoaded = true
+	if c.persistDirectory != "" {
+		doc.persistPath = c.getDocPath(doc.ID)
+	}
 	// We don't defer the unlock because we want to do it earlier.
 	c.documents[doc.ID] = &doc
 	c.docsListValid = false
@@ -281,10 +287,17 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 
 	// Persist the document
 	if c.persistDirectory != "" {
-		docPath := c.getDocPath(doc.ID)
+		docPath := doc.persistPath
 		err := persistToFile(docPath, doc, c.compress, "")
 		if err != nil {
 			return fmt.Errorf("couldn't persist document to %q: %w", docPath, err)
+		}
+		if c.streamEmbeddingsOnQuery {
+			c.documentsLock.Lock()
+			if storedDoc, ok := c.documents[doc.ID]; ok {
+				storedDoc.Embedding = nil
+			}
+			c.documentsLock.Unlock()
 		}
 	}
 
@@ -308,6 +321,13 @@ func (c *Collection) ListIDs(_ context.Context) []string {
 // are a deep copy of the original ones, so you can modify them without affecting
 // the collection.
 func (c *Collection) ListDocuments(_ context.Context) ([]*Document, error) {
+	if err := c.ensureAllDocumentEmbeddingsLoaded(); err != nil {
+		return nil, err
+	}
+	if err := c.ensureAllDocumentPayloadLoaded(); err != nil {
+		return nil, err
+	}
+
 	c.documentsLock.RLock()
 	defer c.documentsLock.RUnlock()
 
@@ -323,6 +343,13 @@ func (c *Collection) ListDocuments(_ context.Context) ([]*Document, error) {
 // metadata and embeddings point to the original data, so modifying them will be
 // reflected in the collection.
 func (c *Collection) ListDocumentsShallow(_ context.Context) ([]*Document, error) {
+	if err := c.ensureAllDocumentEmbeddingsLoaded(); err != nil {
+		return nil, err
+	}
+	if err := c.ensureAllDocumentPayloadLoaded(); err != nil {
+		return nil, err
+	}
+
 	c.documentsLock.RLock()
 	defer c.documentsLock.RUnlock()
 
@@ -337,6 +364,13 @@ func (c *Collection) ListDocumentsShallow(_ context.Context) ([]*Document, error
 // ListDocumentsPartial returns a partial version of all documents in the collection,
 // containing only the ID and content, but not the embedding or metadata values.
 func (c *Collection) ListDocumentsPartial(_ context.Context) ([]*Document, error) {
+	if err := c.ensureAllDocumentEmbeddingsLoaded(); err != nil {
+		return nil, err
+	}
+	if err := c.ensureAllDocumentPayloadLoaded(); err != nil {
+		return nil, err
+	}
+
 	c.documentsLock.RLock()
 	defer c.documentsLock.RUnlock()
 
@@ -357,15 +391,22 @@ func (c *Collection) GetByID(_ context.Context, id string) (Document, error) {
 	}
 
 	c.documentsLock.RLock()
-	defer c.documentsLock.RUnlock()
-
 	doc, ok := c.documents[id]
-	if ok {
-		res := cloneDocument(doc)
-		return *res, nil
+	c.documentsLock.RUnlock()
+
+	if !ok {
+		return Document{}, fmt.Errorf("document with ID '%v' not found", id)
 	}
 
-	return Document{}, fmt.Errorf("document with ID '%v' not found", id)
+	if _, err := c.ensureDocumentEmbeddingLoaded(doc, true); err != nil {
+		return Document{}, err
+	}
+
+	if err := c.ensureDocumentPayloadLoaded(doc); err != nil {
+		return Document{}, err
+	}
+	res := cloneDocument(doc)
+	return *res, nil
 }
 
 // GetByMetadata returns a set of documents, filtered by their metadata.
@@ -374,6 +415,13 @@ func (c *Collection) GetByID(_ context.Context, id string) (Document, error) {
 // The returned documents are a deep copy of the original document, so they can
 // be safely modified without affecting the collection.
 func (c *Collection) GetByMetadata(_ context.Context, where map[string]string) ([]*Document, error) {
+	if err := c.ensureAllDocumentEmbeddingsLoaded(); err != nil {
+		return nil, err
+	}
+	if err := c.ensureAllDocumentPayloadLoaded(); err != nil {
+		return nil, err
+	}
+
 	c.documentsLock.RLock()
 	defer c.documentsLock.RUnlock()
 
@@ -412,6 +460,12 @@ func (c *Collection) Delete(_ context.Context, where, whereDocument map[string]s
 	for k := range whereDocument {
 		if !slices.Contains(supportedFilters, k) {
 			return errors.New("unsupported whereDocument operator")
+		}
+	}
+
+	if where != nil || whereDocument != nil {
+		if err := c.ensureAllDocumentPayloadLoaded(); err != nil {
+			return err
 		}
 	}
 
@@ -621,6 +675,9 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	filteredDocs := docs
 	shouldReleaseFilteredDocs := false
 	if len(where) > 0 || len(whereDocument) > 0 {
+		if err := c.ensureAllDocumentPayloadLoaded(); err != nil {
+			return nil, fmt.Errorf("couldn't load document payloads for filtering: %w", err)
+		}
 		filteredDocs, shouldReleaseFilteredDocs = filterDocs(docs, where, whereDocument)
 	}
 	if shouldReleaseFilteredDocs {
@@ -643,7 +700,13 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	resLen := min(len(filteredDocs), nResults)
 
 	// For the remaining documents, get the most similar docs.
-	nMaxDocs, err := getMostSimilarDocs(ctx, queryEmbedding, negativeEmbeddings, negativeFilterThreshold, filteredDocs, resLen)
+	var nMaxDocs []docSim
+	var err error
+	if c.streamEmbeddingsOnQuery {
+		nMaxDocs, err = c.getMostSimilarDocsStreaming(ctx, queryEmbedding, negativeEmbeddings, negativeFilterThreshold, filteredDocs, resLen)
+	} else {
+		nMaxDocs, err = getMostSimilarDocs(ctx, queryEmbedding, negativeEmbeddings, negativeFilterThreshold, filteredDocs, resLen)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get most similar docs: %w", err)
 	}
@@ -651,16 +714,229 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	res := make([]Result, 0, len(nMaxDocs))
 	for i := range nMaxDocs {
 		doc := nMaxDocs[i].doc
+		embedding := doc.Embedding
+		if len(embedding) == 0 {
+			embedding, err = c.ensureDocumentEmbeddingLoaded(doc, !c.streamEmbeddingsOnQuery)
+			if err != nil {
+				return nil, fmt.Errorf("couldn't load document embedding for '%s': %w", doc.ID, err)
+			}
+		}
+		if err := c.ensureDocumentPayloadLoaded(doc); err != nil {
+			return nil, fmt.Errorf("couldn't load document payload for '%s': %w", doc.ID, err)
+		}
 		res = append(res, Result{
 			ID:         doc.ID,
 			Metadata:   doc.Metadata,
-			Embedding:  doc.Embedding,
+			Embedding:  embedding,
 			Content:    doc.Content,
 			Similarity: nMaxDocs[i].similarity,
 		})
 	}
 
 	return res, nil
+}
+
+func (c *Collection) ensureDocumentPayloadLoaded(doc *Document) error {
+	if doc == nil || doc.payloadLoaded {
+		return nil
+	}
+	if doc.persistPath == "" {
+		doc.payloadLoaded = true
+		return nil
+	}
+
+	c.documentsLock.Lock()
+	defer c.documentsLock.Unlock()
+
+	if doc.payloadLoaded {
+		return nil
+	}
+
+	tmp := struct {
+		Metadata map[string]string
+		Content  string
+	}{}
+	if err := readFromFile(doc.persistPath, &tmp, ""); err != nil {
+		return fmt.Errorf("couldn't read document payload from %q: %w", doc.persistPath, err)
+	}
+
+	doc.Metadata = tmp.Metadata
+	doc.Content = tmp.Content
+	doc.payloadLoaded = true
+	return nil
+}
+
+func (c *Collection) ensureDocumentEmbeddingLoaded(doc *Document, cache bool) ([]float32, error) {
+	if doc == nil {
+		return nil, errors.New("document is nil")
+	}
+	if len(doc.Embedding) > 0 {
+		return doc.Embedding, nil
+	}
+	if doc.persistPath == "" {
+		return nil, fmt.Errorf("document '%s' has no embedding in memory and no persistence path", doc.ID)
+	}
+
+	tmp := struct {
+		Embedding []float32
+	}{}
+	if err := readFromFile(doc.persistPath, &tmp, ""); err != nil {
+		return nil, fmt.Errorf("couldn't read document embedding from %q: %w", doc.persistPath, err)
+	}
+	if len(tmp.Embedding) == 0 {
+		return nil, fmt.Errorf("document '%s' embedding is empty", doc.ID)
+	}
+
+	if cache {
+		c.documentsLock.Lock()
+		if len(doc.Embedding) == 0 {
+			doc.Embedding = tmp.Embedding
+		}
+		embedding := doc.Embedding
+		c.documentsLock.Unlock()
+		return embedding, nil
+	}
+
+	return tmp.Embedding, nil
+}
+
+func (c *Collection) ensureAllDocumentPayloadLoaded() error {
+	docs := c.getDocumentsListSnapshot()
+
+	for _, doc := range docs {
+		if err := c.ensureDocumentPayloadLoaded(doc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Collection) ensureAllDocumentEmbeddingsLoaded() error {
+	docs := c.getDocumentsListSnapshot()
+
+	for _, doc := range docs {
+		if _, err := c.ensureDocumentEmbeddingLoaded(doc, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Collection) getMostSimilarDocsStreaming(ctx context.Context, queryVectors, negativeVector []float32, negativeFilterThreshold float32, docs []*Document, n int) ([]docSim, error) {
+	numDocs := len(docs)
+	vectorDim := len(queryVectors)
+	if negativeFilterThreshold > 0 && len(negativeVector) != vectorDim {
+		return nil, fmt.Errorf("couldn't calculate negative similarity: vectors must have the same length")
+	}
+
+	concurrency := queryConcurrency(numDocs, len(queryVectors))
+	if concurrency == 0 {
+		return nil, nil
+	}
+
+	if concurrency == 1 || numDocs < getQuerySequentialDocsThreshold() {
+		localMaxDocs := newMaxDocSims(n)
+		for _, doc := range docs {
+			embedding, err := c.ensureDocumentEmbeddingLoaded(doc, false)
+			if err != nil {
+				return nil, err
+			}
+			if len(embedding) != vectorDim {
+				return nil, fmt.Errorf("couldn't calculate similarity for document '%s': vectors must have the same length", doc.ID)
+			}
+
+			sim := float32(0)
+			if negativeFilterThreshold > 0 {
+				nsim := float32(0)
+				sim, nsim = dotProductPairScalar(queryVectors, negativeVector, embedding)
+				if nsim > negativeFilterThreshold {
+					continue
+				}
+			} else {
+				sim = dotProductOptimized(queryVectors, embedding)
+			}
+
+			localMaxDocs.add(docSim{doc: doc, similarity: sim})
+		}
+
+		return localMaxDocs.values(), nil
+	}
+
+	var sharedErr error
+	sharedErrLock := sync.Mutex{}
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	setSharedErr := func(err error) {
+		sharedErrLock.Lock()
+		defer sharedErrLock.Unlock()
+		if sharedErr == nil {
+			sharedErr = err
+			cancel(sharedErr)
+		}
+	}
+
+	wg := sync.WaitGroup{}
+	resultsChan := make(chan []docSim, concurrency)
+	chunkSize := queryChunkSize(numDocs)
+	for i := range concurrency {
+		wg.Add(1)
+		go func(workerIndex int) {
+			defer wg.Done()
+			localMaxDocs := newMaxDocSims(n)
+			workerStart, workerEnd := workerRange(numDocs, concurrency, workerIndex)
+			for start := workerStart; start < workerEnd; start += chunkSize {
+				if ctx.Err() != nil {
+					break
+				}
+				end := min(start+chunkSize, workerEnd)
+				for _, doc := range docs[start:end] {
+					if ctx.Err() != nil {
+						break
+					}
+
+					embedding, err := c.ensureDocumentEmbeddingLoaded(doc, false)
+					if err != nil {
+						setSharedErr(fmt.Errorf("couldn't load embedding for document '%s': %w", doc.ID, err))
+						break
+					}
+					if len(embedding) != vectorDim {
+						setSharedErr(fmt.Errorf("couldn't calculate similarity for document '%s': vectors must have the same length", doc.ID))
+						break
+					}
+
+					sim := float32(0)
+					if negativeFilterThreshold > 0 {
+						nsim := float32(0)
+						sim, nsim = dotProductPairScalar(queryVectors, negativeVector, embedding)
+						if nsim > negativeFilterThreshold {
+							continue
+						}
+					} else {
+						sim = dotProductOptimized(queryVectors, embedding)
+					}
+
+					localMaxDocs.add(docSim{doc: doc, similarity: sim})
+				}
+			}
+			resultsChan <- localMaxDocs.values()
+		}(i)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	if sharedErr != nil {
+		return nil, sharedErr
+	}
+
+	nMaxDocs := newMaxDocSims(n)
+	for workerTopK := range resultsChan {
+		for _, doc := range workerTopK {
+			nMaxDocs.add(doc)
+		}
+	}
+
+	return nMaxDocs.values(), nil
 }
 
 // getDocPath generates the path to the document file.

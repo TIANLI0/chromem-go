@@ -6,8 +6,8 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"slices"
-	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -978,6 +978,95 @@ func BenchmarkCollection_Query_NoContent_1536_Approx1GiB_ParallelLatencyMatrix(b
 	}
 }
 
+func BenchmarkCollection_Query_NoContent_1536_Approx1GiB_PersistentModes(b *testing.B) {
+	n := benchmarkDocCountForEmbeddingBytes(1536, benchmarkTargetEmbeddingBytes1GiB)
+
+	ctx := context.Background()
+	r := rand.New(rand.NewSource(42))
+	d := 1536
+
+	qv := make([]float32, d)
+	for j := range d {
+		qv[j] = r.Float32()
+	}
+	qv = normalizeVector(qv)
+
+	baseDir, err := os.MkdirTemp("", "chromem-go-persist-modes")
+	if err != nil {
+		b.Fatal("expected no error, got", err)
+	}
+	defer os.RemoveAll(baseDir)
+
+	dataDir := filepath.Join(baseDir, "data")
+	sourceDB, err := NewPersistentDBWithOptions(dataDir, PersistentDBOptions{Compress: false})
+	if err != nil {
+		b.Fatal("expected no error, got", err)
+	}
+
+	name := "test"
+	embeddingFunc := func(_ context.Context, text string) ([]float32, error) {
+		return nil, errors.New("embedding func not expected to be called")
+	}
+
+	c, err := sourceDB.CreateCollection(name, nil, embeddingFunc)
+	if err != nil {
+		b.Fatal("expected no error, got", err)
+	}
+
+	for i := range n {
+		v := make([]float32, d)
+		for j := range d {
+			v[j] = r.Float32()
+		}
+		v = normalizeVector(v)
+
+		doc := Document{ID: strconv.Itoa(i), Embedding: v}
+		if err := c.AddDocument(ctx, doc); err != nil {
+			b.Fatal("expected nil, got", err)
+		}
+	}
+
+	type mode struct {
+		name    string
+		options PersistentDBOptions
+	}
+	modes := []mode{
+		{name: "default_preload", options: PersistentDBOptions{Compress: false}},
+		{name: "lazy_payload", options: PersistentDBOptions{Compress: false, LazyLoadPayload: true}},
+		{name: "stream_embeddings", options: PersistentDBOptions{Compress: false, LazyLoadPayload: true, StreamEmbeddingsOnQuery: true}},
+	}
+
+	for _, m := range modes {
+		b.Run(m.name, func(b *testing.B) {
+			openStart := time.Now()
+			dbMode, openErr := NewPersistentDBWithOptions(dataDir, m.options)
+			if openErr != nil {
+				b.Fatal("expected no error, got", openErr)
+			}
+			openMs := float64(time.Since(openStart).Milliseconds())
+
+			col := dbMode.GetCollection(name, embeddingFunc)
+			if col == nil {
+				b.Fatal("expected collection, got nil")
+			}
+
+			stats := col.MemoryStats()
+			b.ReportMetric(openMs, "startup_ms")
+			b.ReportMetric(float64(stats.ApproxEmbeddingBytes)/(1024*1024), "embedMiB")
+			b.ReportMetric(float64(stats.RuntimeHeapInuse)/(1024*1024), "heapInuseMiB")
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				res, queryErr := col.QueryEmbedding(ctx, qv, 10, nil, nil)
+				if queryErr != nil {
+					b.Fatal("expected nil, got", queryErr)
+				}
+				globalRes = res
+			}
+		})
+	}
+}
+
 type parallelLatencyResult struct {
 	TotalQueries int64
 	QPS          float64
@@ -997,9 +1086,7 @@ func runParallelQueryLatencyWindow(ctx context.Context, c *Collection, qv []floa
 	startCh := make(chan struct{})
 	wg := sync.WaitGroup{}
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-startCh
 
 			for time.Now().Before(deadline) {
@@ -1019,7 +1106,7 @@ func runParallelQueryLatencyWindow(ctx context.Context, c *Collection, qv []floa
 				latenciesLock.Unlock()
 				totalQueries.Add(1)
 			}
-		}()
+		})
 	}
 
 	windowStart := time.Now()
@@ -1037,7 +1124,7 @@ func runParallelQueryLatencyWindow(ctx context.Context, c *Collection, qv []floa
 		return parallelLatencyResult{}, errors.New("no latencies recorded in benchmark window")
 	}
 
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.Sort(latencies)
 	qps := float64(totalQueries.Load()) / elapsed.Seconds()
 
 	return parallelLatencyResult{
@@ -1053,10 +1140,7 @@ func percentileLatencyMs(sortedNs []int64, percentile float64) float64 {
 	if len(sortedNs) == 0 {
 		return 0
 	}
-	idx := int(math.Ceil(percentile*float64(len(sortedNs)))) - 1
-	if idx < 0 {
-		idx = 0
-	}
+	idx := max(int(math.Ceil(percentile*float64(len(sortedNs))))-1, 0)
 	if idx >= len(sortedNs) {
 		idx = len(sortedNs) - 1
 	}

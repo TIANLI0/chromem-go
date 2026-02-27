@@ -1,0 +1,27 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "sanity-echo",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"\"go version | Out-File -FilePath gv.txt -Encoding utf8\""
+			],
+			"isBackground": false
+		},
+		{
+			"label": "bench-persistent-modes-1g",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"\"go test -run '^$' -bench '^BenchmarkCollection_Query_NoContent_1536_Approx1GiB_PersistentModes$' -benchmem -benchtime 1x -count 1 . | Out-File -FilePath bench_persistent_modes.txt -Encoding utf8\""
+			],
+			"isBackground": false
+		}
+	]
+}

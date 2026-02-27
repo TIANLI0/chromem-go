@@ -12,6 +12,9 @@ type Document struct {
 	Embedding []float32
 	Content   string
 
+	persistPath   string
+	payloadLoaded bool
+
 	// ⚠️ When adding unexported fields here, consider adding a persistence struct
 	// version of this in [DB.Export] and [DB.Import].
 }

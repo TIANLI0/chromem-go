@@ -31,11 +31,20 @@ type DB struct {
 	collections     map[string]*Collection
 	collectionsLock sync.RWMutex
 
-	persistDirectory string
-	compress         bool
+	persistDirectory        string
+	compress                bool
+	lazyLoadPayload         bool
+	streamEmbeddingsOnQuery bool
 
 	// ⚠️ When adding fields here, consider adding them to the persistence struct
 	// versions in [DB.Export] and [DB.Import] as well!
+}
+
+// PersistentDBOptions configures persistent DB behavior.
+type PersistentDBOptions struct {
+	Compress                bool
+	LazyLoadPayload         bool
+	StreamEmbeddingsOnQuery bool
 }
 
 // NewDB creates a new in-memory chromem-go DB.
@@ -67,6 +76,15 @@ func NewDB() *DB {
 // [DB.ImportFromReader] to export and import the entire DB to/from a file or
 // writer/reader, which also works for the pure in-memory DB.
 func NewPersistentDB(path string, compress bool) (*DB, error) {
+	return NewPersistentDBWithOptions(path, PersistentDBOptions{Compress: compress})
+}
+
+// NewPersistentDBWithOptions creates a new persistent chromem-go DB with optional
+// memory-saving behavior.
+//
+// If LazyLoadPayload is true, only document embeddings are loaded at startup;
+// document metadata/content are loaded on demand when needed.
+func NewPersistentDBWithOptions(path string, options PersistentDBOptions) (*DB, error) {
 	if path == "" {
 		path = "./chromem-go"
 	} else {
@@ -76,14 +94,16 @@ func NewPersistentDB(path string, compress bool) (*DB, error) {
 
 	// We check for this file extension and skip others
 	ext := ".gob"
-	if compress {
+	if options.Compress {
 		ext += ".gz"
 	}
 
 	db := &DB{
-		collections:      make(map[string]*Collection),
-		persistDirectory: path,
-		compress:         compress,
+		collections:             make(map[string]*Collection),
+		persistDirectory:        path,
+		compress:                options.Compress,
+		lazyLoadPayload:         options.LazyLoadPayload,
+		streamEmbeddingsOnQuery: options.StreamEmbeddingsOnQuery,
 	}
 
 	// If the directory doesn't exist, create it and return an empty DB.
@@ -123,9 +143,10 @@ func NewPersistentDB(path string, compress bool) (*DB, error) {
 			return nil, fmt.Errorf("couldn't read collection directory: %w", err)
 		}
 		c := &Collection{
-			documents:        make(map[string]*Document),
-			persistDirectory: collectionPath,
-			compress:         compress,
+			documents:               make(map[string]*Document),
+			persistDirectory:        collectionPath,
+			compress:                options.Compress,
+			streamEmbeddingsOnQuery: options.StreamEmbeddingsOnQuery,
 			// We can fill Name and metadata only after reading
 			// the metadata.
 			// We can fill embed only when the user calls DB.GetCollection() or
@@ -153,13 +174,65 @@ func NewPersistentDB(path string, compress bool) (*DB, error) {
 				c.Name = pc.Name
 				c.metadata = pc.Metadata
 			} else if strings.HasSuffix(collectionDirEntry.Name(), ext) {
-				// Read document
-				d := &Document{}
-				err := readFromFile(fPath, d, "")
-				if err != nil {
-					return nil, fmt.Errorf("couldn't read document: %w", err)
+				if options.StreamEmbeddingsOnQuery {
+					if options.LazyLoadPayload {
+						tmp := struct {
+							ID string
+						}{}
+						err := readFromFile(fPath, &tmp, "")
+						if err != nil {
+							return nil, fmt.Errorf("couldn't read document id: %w", err)
+						}
+						c.documents[tmp.ID] = &Document{
+							ID:            tmp.ID,
+							persistPath:   fPath,
+							payloadLoaded: false,
+						}
+					} else {
+						tmp := struct {
+							ID       string
+							Metadata map[string]string
+							Content  string
+						}{}
+						err := readFromFile(fPath, &tmp, "")
+						if err != nil {
+							return nil, fmt.Errorf("couldn't read document payload: %w", err)
+						}
+						c.documents[tmp.ID] = &Document{
+							ID:            tmp.ID,
+							Metadata:      tmp.Metadata,
+							Content:       tmp.Content,
+							persistPath:   fPath,
+							payloadLoaded: true,
+						}
+					}
+				} else if options.LazyLoadPayload {
+					// Read only the fields required for vector search startup.
+					tmp := struct {
+						ID        string
+						Embedding []float32
+					}{}
+					err := readFromFile(fPath, &tmp, "")
+					if err != nil {
+						return nil, fmt.Errorf("couldn't read document embedding: %w", err)
+					}
+					c.documents[tmp.ID] = &Document{
+						ID:            tmp.ID,
+						Embedding:     tmp.Embedding,
+						persistPath:   fPath,
+						payloadLoaded: false,
+					}
+				} else {
+					// Read full document.
+					d := &Document{}
+					err := readFromFile(fPath, d, "")
+					if err != nil {
+						return nil, fmt.Errorf("couldn't read document: %w", err)
+					}
+					d.persistPath = fPath
+					d.payloadLoaded = true
+					c.documents[d.ID] = d
 				}
-				c.documents[d.ID] = d
 			} else {
 				// Might be a file that the user has placed
 				continue
@@ -256,8 +329,12 @@ func (db *DB) ImportFromFile(filePath string, encryptionKey string, collections 
 		c := &Collection{
 			Name: pc.Name,
 
-			metadata:  pc.Metadata,
-			documents: pc.Documents,
+			metadata:                pc.Metadata,
+			documents:               pc.Documents,
+			streamEmbeddingsOnQuery: db.streamEmbeddingsOnQuery,
+		}
+		for _, doc := range c.documents {
+			doc.payloadLoaded = !db.lazyLoadPayload
 		}
 		if db.persistDirectory != "" {
 			c.persistDirectory = filepath.Join(db.persistDirectory, hash2hex(pc.Name))
@@ -268,6 +345,15 @@ func (db *DB) ImportFromFile(filePath string, encryptionKey string, collections 
 			}
 			for _, doc := range c.documents {
 				docPath := c.getDocPath(doc.ID)
+				doc.persistPath = docPath
+				doc.payloadLoaded = !db.lazyLoadPayload
+				if db.streamEmbeddingsOnQuery {
+					doc.Embedding = nil
+				}
+				if db.lazyLoadPayload {
+					doc.Metadata = nil
+					doc.Content = ""
+				}
 				err = persistToFile(docPath, doc, c.compress, "")
 				if err != nil {
 					return fmt.Errorf("couldn't persist document to %q: %w", docPath, err)
@@ -331,8 +417,12 @@ func (db *DB) ImportFromReader(reader io.ReadSeeker, encryptionKey string, colle
 		c := &Collection{
 			Name: pc.Name,
 
-			metadata:  pc.Metadata,
-			documents: pc.Documents,
+			metadata:                pc.Metadata,
+			documents:               pc.Documents,
+			streamEmbeddingsOnQuery: db.streamEmbeddingsOnQuery,
+		}
+		for _, doc := range c.documents {
+			doc.payloadLoaded = !db.lazyLoadPayload
 		}
 		if db.persistDirectory != "" {
 			c.persistDirectory = filepath.Join(db.persistDirectory, hash2hex(pc.Name))
@@ -343,6 +433,15 @@ func (db *DB) ImportFromReader(reader io.ReadSeeker, encryptionKey string, colle
 			}
 			for _, doc := range c.documents {
 				docPath := c.getDocPath(doc.ID)
+				doc.persistPath = docPath
+				doc.payloadLoaded = !db.lazyLoadPayload
+				if db.streamEmbeddingsOnQuery {
+					doc.Embedding = nil
+				}
+				if db.lazyLoadPayload {
+					doc.Metadata = nil
+					doc.Content = ""
+				}
 				err := persistToFile(docPath, doc, c.compress, "")
 				if err != nil {
 					return fmt.Errorf("couldn't persist document to %q: %w", docPath, err)
@@ -417,6 +516,18 @@ func (db *DB) ExportToFile(filePath string, compress bool, encryptionKey string,
 
 	for k, v := range db.collections {
 		if len(collections) == 0 || slices.Contains(collections, k) {
+			if db.streamEmbeddingsOnQuery {
+				err := v.ensureAllDocumentEmbeddingsLoaded()
+				if err != nil {
+					return fmt.Errorf("couldn't load embeddings for export collection %q: %w", k, err)
+				}
+			}
+			if db.lazyLoadPayload {
+				err := v.ensureAllDocumentPayloadLoaded()
+				if err != nil {
+					return fmt.Errorf("couldn't load payloads for export collection %q: %w", k, err)
+				}
+			}
 			persistenceDB.Collections[k] = &persistenceCollection{
 				Name:      v.Name,
 				Metadata:  v.metadata,
@@ -474,6 +585,18 @@ func (db *DB) ExportToWriter(writer io.Writer, compress bool, encryptionKey stri
 
 	for k, v := range db.collections {
 		if len(collections) == 0 || slices.Contains(collections, k) {
+			if db.streamEmbeddingsOnQuery {
+				err := v.ensureAllDocumentEmbeddingsLoaded()
+				if err != nil {
+					return fmt.Errorf("couldn't load embeddings for export collection %q: %w", k, err)
+				}
+			}
+			if db.lazyLoadPayload {
+				err := v.ensureAllDocumentPayloadLoaded()
+				if err != nil {
+					return fmt.Errorf("couldn't load payloads for export collection %q: %w", k, err)
+				}
+			}
 			persistenceDB.Collections[k] = &persistenceCollection{
 				Name:      v.Name,
 				Metadata:  v.metadata,
@@ -503,7 +626,7 @@ func (db *DB) CreateCollection(name string, metadata map[string]string, embeddin
 	if embeddingFunc == nil {
 		embeddingFunc = NewEmbeddingFuncDefault()
 	}
-	collection, err := newCollection(name, metadata, embeddingFunc, db.persistDirectory, db.compress)
+	collection, err := newCollection(name, metadata, embeddingFunc, db.persistDirectory, db.compress, db.streamEmbeddingsOnQuery)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create collection: %w", err)
 	}

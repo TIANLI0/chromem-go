@@ -203,6 +203,44 @@ Observed range:
 
 Interpretation: throughput plateaus around 4-8 workers while tail latency rises rapidly beyond that.
 
+### Persistent mode comparison (1GiB @ 1536 dims)
+
+Measured on this machine (`windows/amd64`, Intel i7-14700F):
+
+```console
+go test -run '^$' -bench '^BenchmarkCollection_Query_NoContent_1536_Approx1GiB_PersistentModes$' -benchmem -benchtime 1x -count 1 .
+```
+
+Observed query-time results (`nResults=10`):
+
+- `default_preload`: `47.38ms/op`, `1.49MB/op`, `3,976 allocs/op`
+- `lazy_payload`: `46.80ms/op`, `1.71MB/op`, `5,933 allocs/op`
+- `stream_embeddings`: `1050.32ms/op`, `4.87GB/op`, `32,339,674 allocs/op`
+
+Interpretation:
+
+- `default_preload` and `lazy_payload` are close for embedding-only workloads (payload is tiny/empty here).
+- `stream_embeddings` massively reduces resident embedding memory but trades off a lot of query throughput and increases allocations due to per-query disk reads and decode overhead.
+- Recommended production default for balanced performance is still preload (or `lazy_payload` when content/metadata memory dominates).
+
+Quick mode selection:
+
+| Goal | Mode | Recommended options | Trade-off |
+| --- | --- | --- | --- |
+| Lowest query latency / highest throughput | `default_preload` | `PersistentDBOptions{Compress:false}` | Highest resident memory usage |
+| Lower startup memory, similar query speed | `lazy_payload` | `PersistentDBOptions{Compress:false, LazyLoadPayload:true}` | First access to content/metadata may read from disk |
+| Minimum resident memory | `stream_embeddings` | `PersistentDBOptions{Compress:false, LazyLoadPayload:true, StreamEmbeddingsOnQuery:true}` | Large query slowdown and much higher per-query allocations |
+
+For most production workloads: start with `lazy_payload`, benchmark with your real data, and only use `stream_embeddings` when memory pressure is the top priority.
+
+3-step decision flow:
+
+1. If your dataset comfortably fits RAM, start with `default_preload`.
+2. If startup memory is high but query latency still matters, switch to `lazy_payload`.
+3. If RAM is still not enough, move to `stream_embeddings` and accept lower query throughput.
+
+After choosing a mode, re-run the benchmark with your real filters/content mix and tune query concurrency (`CHROMEM_QUERY_MAX_CONCURRENCY`) for your latency target.
+
 ## Features
 
 - [X] Zero dependencies on third party libraries
@@ -388,6 +426,8 @@ The query path supports a SIMD-optimized dot product (Go `GOEXPERIMENT=simd`, AM
   - `CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR`
   - `CHROMEM_QUERY_MAX_CONCURRENCY` (`0` means no hard cap)
   - equivalent APIs: `SetQuerySmallDocsThreshold`, `SetQuerySequentialDocsThreshold`, `SetQueryHighDimThreshold`, `SetQueryHighDimConcurrencyDivisor`, `SetQueryMaxConcurrency`
+- Persistent DB startup memory can be reduced with `NewPersistentDBWithOptions(..., PersistentDBOptions{LazyLoadPayload: true})`, which keeps embeddings in memory and loads content/metadata on demand.
+- For an ultra-low-memory mode, set `StreamEmbeddingsOnQuery: true` to stream embeddings from disk during query instead of keeping them resident.
 
 Based on benchmark runs on Intel i7-14700F:
 
@@ -400,6 +440,14 @@ For 1GiB / 1536-dim workloads, prefer running query concurrency around 4-8 worke
 #### Recommended presets (copy/paste)
 
 The following presets are good starting points for library users. Keep `CHROMEM_SIMD_MIN_LENGTH=1536` unless your benchmarks show a better value.
+
+- Large persistent datasets with limited RAM:
+  - use `NewPersistentDBWithOptions(path, chromem.PersistentDBOptions{Compress: false, LazyLoadPayload: true})`
+  - pair with `CHROMEM_QUERY_MAX_CONCURRENCY=4..8` based on your latency budget
+
+- Ultra-low-memory mode (accept lower query throughput):
+  - use `NewPersistentDBWithOptions(path, chromem.PersistentDBOptions{Compress: false, LazyLoadPayload: true, StreamEmbeddingsOnQuery: true})`
+  - useful when dataset size exceeds available RAM
 
 - Low-latency API (stable p95/p99):
   - `CHROMEM_QUERY_MAX_CONCURRENCY=4`
