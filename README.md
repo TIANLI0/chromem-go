@@ -426,6 +426,14 @@ The query path supports a SIMD-optimized dot product (Go `GOEXPERIMENT=simd`, AM
   - `CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR`
   - `CHROMEM_QUERY_MAX_CONCURRENCY` (`0` means no hard cap)
   - equivalent APIs: `SetQuerySmallDocsThreshold`, `SetQuerySequentialDocsThreshold`, `SetQueryHighDimThreshold`, `SetQueryHighDimConcurrencyDivisor`, `SetQueryMaxConcurrency`
+- HNSW index behavior can be tuned with:
+  - `CHROMEM_HNSW_ENABLED` (`true`/`false`, default `true`)
+  - `CHROMEM_HNSW_M` (default `16`)
+  - `CHROMEM_HNSW_EF_CONSTRUCTION` (default `128`)
+  - `CHROMEM_HNSW_EF_SEARCH` (default `64`)
+  - `CHROMEM_HNSW_TOMBSTONE_REBUILD_RATIO` (default `0.2`, `0` disables auto-compaction)
+  - `CHROMEM_HNSW_TOMBSTONE_REBUILD_MIN_DELETED` (default `2048`)
+  - equivalent APIs: `SetHNSWEnabled`, `SetHNSWM`, `SetHNSWEFConstruction`, `SetHNSWEFSearch`, `SetHNSWTombstoneRebuildRatio`, `SetHNSWTombstoneRebuildMinDeleted`
 - Persistent DB startup memory can be reduced with `NewPersistentDBWithOptions(..., PersistentDBOptions{LazyLoadPayload: true})`, which keeps embeddings in memory and loads content/metadata on demand.
 - For an ultra-low-memory mode, set `StreamEmbeddingsOnQuery: true` to stream embeddings from disk during query instead of keeping them resident.
 
@@ -465,6 +473,14 @@ Programmatic equivalent:
 // Example: throughput-oriented profile.
 chromem.SetQueryMaxConcurrency(8)
 chromem.SetQueryHighDimConcurrencyDivisor(2)
+
+// Example: HNSW tuning profile.
+chromem.SetHNSWEnabled(true)
+chromem.SetHNSWM(24)
+chromem.SetHNSWEFConstruction(256)
+chromem.SetHNSWEFSearch(96)
+chromem.SetHNSWTombstoneRebuildRatio(0.2)
+chromem.SetHNSWTombstoneRebuildMinDeleted(2048)
 ```
 
 Environment variables (no code changes in consuming app):
@@ -473,7 +489,37 @@ Environment variables (no code changes in consuming app):
 CHROMEM_SIMD_MIN_LENGTH=1536
 CHROMEM_QUERY_MAX_CONCURRENCY=8
 CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR=2
+CHROMEM_HNSW_ENABLED=true
+CHROMEM_HNSW_M=16
+CHROMEM_HNSW_EF_CONSTRUCTION=128
+CHROMEM_HNSW_EF_SEARCH=64
+CHROMEM_HNSW_TOMBSTONE_REBUILD_RATIO=0.2
+CHROMEM_HNSW_TOMBSTONE_REBUILD_MIN_DELETED=2048
 ```
+
+#### HNSW mutation strategy notes
+
+- `AddDocument` append path uses incremental HNSW insert (copy-on-write index replacement).
+- `AddDocument` overwrite path uses incremental upsert (old node tombstoned, new node inserted).
+- `Delete` path uses incremental tombstone marking (no immediate global rebuild).
+- Query path lazily compacts (rebuilds) the graph only when tombstone thresholds are exceeded.
+- This keeps write-path latency low while recovering long-term graph quality under heavy mutations.
+
+HNSW enabled vs disabled benchmark comparison:
+
+```bash
+go test -run '^$' -bench '^BenchmarkCollection_Query_NoContent_1536_100k_HNSWToggle$' -benchmem -benchtime=1x -count=5 > hnsw_toggle.out
+```
+
+Then compare with other runs using `benchstat`.
+
+HNSW Recall@K (vs brute-force ground truth) + performance comparison:
+
+```bash
+go test -run '^$' -bench '^BenchmarkCollection_Query_NoContent_1536_100k_HNSWRecallAt10$' -benchmem -benchtime=1x -count=3 > hnsw_recall.out
+```
+
+The benchmark reports `recall_at_10` for both sub-benchmarks (`hnsw_enabled`, `bruteforce`) so you can evaluate accuracy and speed together.
 
 #### Reproducible matrix benchmark
 

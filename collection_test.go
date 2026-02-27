@@ -915,6 +915,19 @@ func BenchmarkCollection_Query_NoContent_1536_Approx1GiB(b *testing.B) {
 	benchmarkCollection_Query_EmbeddingOnly(b, n, 1536)
 }
 
+func BenchmarkCollection_Query_NoContent_1536_100k_HNSWToggle(b *testing.B) {
+	benchmarkCollection_Query_EmbeddingOnly_HNSWToggle(b, 100_000, 1536)
+}
+
+func BenchmarkCollection_Query_NoContent_1536_Approx1GiB_HNSWToggle(b *testing.B) {
+	n := benchmarkDocCountForEmbeddingBytes(1536, benchmarkTargetEmbeddingBytes1GiB)
+	benchmarkCollection_Query_EmbeddingOnly_HNSWToggle(b, n, 1536)
+}
+
+func BenchmarkCollection_Query_NoContent_1536_100k_HNSWRecallAt10(b *testing.B) {
+	benchmarkCollection_Query_EmbeddingOnly_HNSWRecallAtK(b, 100_000, 1536, 10, 64)
+}
+
 func BenchmarkCollection_Query_NoContent_1536_Approx1GiB_Parallel(b *testing.B) {
 	n := benchmarkDocCountForEmbeddingBytes(1536, benchmarkTargetEmbeddingBytes1GiB)
 	benchmarkCollection_Query_EmbeddingOnlyParallel(b, n, 1536)
@@ -1349,6 +1362,198 @@ func benchmarkCollection_Query_EmbeddingOnlyParallel(b *testing.B, n int, d int)
 			globalRes = res
 		}
 	})
+}
+
+func benchmarkCollection_Query_EmbeddingOnly_HNSWToggle(b *testing.B, n int, d int) {
+	ctx := context.Background()
+
+	r := rand.New(rand.NewSource(42))
+
+	qv := make([]float32, d)
+	for j := range d {
+		qv[j] = r.Float32()
+	}
+	qv = normalizeVector(qv)
+
+	db := NewDB()
+	name := "test"
+	embeddingFunc := func(_ context.Context, text string) ([]float32, error) {
+		return nil, errors.New("embedding func not expected to be called")
+	}
+	c, err := db.CreateCollection(name, nil, embeddingFunc)
+	if err != nil {
+		b.Fatal("expected no error, got", err)
+	}
+	if c == nil {
+		b.Fatal("expected collection, got nil")
+	}
+
+	for i := range n {
+		v := make([]float32, d)
+		for j := range d {
+			v[j] = r.Float32()
+		}
+		v = normalizeVector(v)
+
+		doc := Document{
+			ID:        strconv.Itoa(i),
+			Embedding: v,
+		}
+
+		if err := c.AddDocument(ctx, doc); err != nil {
+			b.Fatal("expected nil, got", err)
+		}
+	}
+
+	oldEnabled := getHNSWEnabled()
+	b.Cleanup(func() {
+		SetHNSWEnabled(oldEnabled)
+	})
+
+	modes := []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "hnsw_enabled", enabled: true},
+		{name: "hnsw_disabled", enabled: false},
+	}
+
+	for _, mode := range modes {
+		b.Run(mode.name, func(b *testing.B) {
+			SetHNSWEnabled(mode.enabled)
+
+			_, err := c.QueryEmbedding(ctx, qv, 10, nil, nil)
+			if err != nil {
+				b.Fatal("expected nil, got", err)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				res, queryErr := c.QueryEmbedding(ctx, qv, 10, nil, nil)
+				if queryErr != nil {
+					b.Fatal("expected nil, got", queryErr)
+				}
+				globalRes = res
+			}
+		})
+	}
+}
+
+func benchmarkCollection_Query_EmbeddingOnly_HNSWRecallAtK(b *testing.B, n int, d int, k int, queryCount int) {
+	ctx := context.Background()
+
+	r := rand.New(rand.NewSource(42))
+	queries := make([][]float32, queryCount)
+	for i := range queryCount {
+		qv := make([]float32, d)
+		for j := range d {
+			qv[j] = r.Float32()
+		}
+		queries[i] = normalizeVector(qv)
+	}
+
+	db := NewDB()
+	name := "test"
+	embeddingFunc := func(_ context.Context, text string) ([]float32, error) {
+		return nil, errors.New("embedding func not expected to be called")
+	}
+	c, err := db.CreateCollection(name, nil, embeddingFunc)
+	if err != nil {
+		b.Fatal("expected no error, got", err)
+	}
+
+	for i := range n {
+		v := make([]float32, d)
+		for j := range d {
+			v[j] = r.Float32()
+		}
+		v = normalizeVector(v)
+		if err := c.AddDocument(ctx, Document{ID: strconv.Itoa(i), Embedding: v}); err != nil {
+			b.Fatal("expected nil, got", err)
+		}
+	}
+
+	oldEnabled := getHNSWEnabled()
+	b.Cleanup(func() {
+		SetHNSWEnabled(oldEnabled)
+	})
+
+	SetHNSWEnabled(false)
+	groundTruth := make([][]string, len(queries))
+	for i, qv := range queries {
+		res, queryErr := c.QueryEmbedding(ctx, qv, k, nil, nil)
+		if queryErr != nil {
+			b.Fatal("expected nil, got", queryErr)
+		}
+		ids := make([]string, len(res))
+		for j := range res {
+			ids[j] = res[j].ID
+		}
+		groundTruth[i] = ids
+	}
+
+	b.Run("hnsw_enabled", func(b *testing.B) {
+		SetHNSWEnabled(true)
+
+		_, warmupErr := c.QueryEmbedding(ctx, queries[0], k, nil, nil)
+		if warmupErr != nil {
+			b.Fatal("expected nil, got", warmupErr)
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			totalRecall := float64(0)
+			for qi, qv := range queries {
+				res, queryErr := c.QueryEmbedding(ctx, qv, k, nil, nil)
+				if queryErr != nil {
+					b.Fatal("expected nil, got", queryErr)
+				}
+				totalRecall += recallAtKFromResults(res, groundTruth[qi], k)
+				globalRes = res
+			}
+
+			avgRecall := totalRecall / float64(len(queries))
+			b.ReportMetric(avgRecall, "recall_at_10")
+			b.ReportMetric(float64(len(queries)), "queries_per_iter")
+		}
+	})
+
+	b.Run("bruteforce", func(b *testing.B) {
+		SetHNSWEnabled(false)
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for _, qv := range queries {
+				res, queryErr := c.QueryEmbedding(ctx, qv, k, nil, nil)
+				if queryErr != nil {
+					b.Fatal("expected nil, got", queryErr)
+				}
+				globalRes = res
+			}
+			b.ReportMetric(1.0, "recall_at_10")
+			b.ReportMetric(float64(len(queries)), "queries_per_iter")
+		}
+	})
+}
+
+func recallAtKFromResults(results []Result, truthIDs []string, k int) float64 {
+	if k <= 0 || len(truthIDs) == 0 {
+		return 0
+	}
+
+	truthSet := make(map[string]struct{}, min(k, len(truthIDs)))
+	for i := 0; i < len(truthIDs) && i < k; i++ {
+		truthSet[truthIDs[i]] = struct{}{}
+	}
+
+	hits := 0
+	for i := 0; i < len(results) && i < k; i++ {
+		if _, ok := truthSet[results[i].ID]; ok {
+			hits++
+		}
+	}
+
+	return float64(hits) / float64(min(k, len(truthIDs)))
 }
 
 var globalDoc *Document

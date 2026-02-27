@@ -152,6 +152,7 @@ func NewPersistentDBWithOptions(path string, options PersistentDBOptions) (*DB, 
 			// We can fill embed only when the user calls DB.GetCollection() or
 			// DB.GetOrCreateCollection().
 		}
+		c.hnswVersion.Store(1)
 		for _, collectionDirEntry := range collectionDirEntries {
 			// Files should be metadata and documents; skip subdirectories which
 			// the user might have placed.
@@ -333,6 +334,7 @@ func (db *DB) ImportFromFile(filePath string, encryptionKey string, collections 
 			documents:               pc.Documents,
 			streamEmbeddingsOnQuery: db.streamEmbeddingsOnQuery,
 		}
+		c.hnswVersion.Store(1)
 		for _, doc := range c.documents {
 			doc.payloadLoaded = !db.lazyLoadPayload
 		}
@@ -421,6 +423,7 @@ func (db *DB) ImportFromReader(reader io.ReadSeeker, encryptionKey string, colle
 			documents:               pc.Documents,
 			streamEmbeddingsOnQuery: db.streamEmbeddingsOnQuery,
 		}
+		c.hnswVersion.Store(1)
 		for _, doc := range c.documents {
 			doc.payloadLoaded = !db.lazyLoadPayload
 		}

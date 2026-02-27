@@ -407,7 +407,18 @@ func TestDB_ImportExport(t *testing.T) {
 			// Check expectations
 			// We have to reset the embed function, but otherwise the DB objects
 			// should be deep equal.
-			c.embed = nil
+			for _, col := range origDB.collections {
+				col.embed = nil
+				col.hnsw = nil
+				col.hnswVersion.Store(0)
+				col.hnswIndexedVersion.Store(0)
+			}
+			for _, col := range newDB.collections {
+				col.embed = nil
+				col.hnsw = nil
+				col.hnswVersion.Store(0)
+				col.hnswIndexedVersion.Store(0)
+			}
 			if !reflect.DeepEqual(origDB, newDB) {
 				t.Fatalf("expected DB %+v, got %+v", origDB, newDB)
 			}

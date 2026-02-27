@@ -18,6 +18,10 @@ vNext
   - `BenchmarkCollection_Query_NoContent_1536_Approx1GiB`
   - `BenchmarkCollection_Query_NoContent_1536_Approx1GiB_Parallel`
   - `BenchmarkCollection_Query_NoContent_1536_Approx1GiB_ParallelLatencyMatrix`
+- Added internal HNSW index persistence for persistent DB collections (index can be reused after restart).
+- Added HNSW tuning controls for mutation-heavy workloads:
+  - `CHROMEM_HNSW_TOMBSTONE_REBUILD_RATIO` / `SetHNSWTombstoneRebuildRatio`
+  - `CHROMEM_HNSW_TOMBSTONE_REBUILD_MIN_DELETED` / `SetHNSWTombstoneRebuildMinDeleted`
 
 ### Improved
 
@@ -34,6 +38,10 @@ vNext
 - Improved query scalability under concurrency via cached document snapshots and reduced lock contention in `QueryEmbedding`.
 - Reduced query-time allocations by switching filter internals from map-based to slice-based pooled processing.
 - Updated SIMD threshold guidance to `1536` and documented high-concurrency tradeoffs for 1536-dim ~1GiB workloads.
+- Improved HNSW mutation efficiency:
+  - append inserts use incremental upsert path (no immediate global rebuild)
+  - delete operations use tombstone marking (no immediate global rebuild)
+  - query path performs lazy compaction rebuild only when tombstone thresholds are exceeded
 
 v0.7.0 (2024-09-01)
 -------------------

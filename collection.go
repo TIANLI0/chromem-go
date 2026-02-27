@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 )
 
 // Collection represents a collection of documents.
@@ -26,9 +27,33 @@ type Collection struct {
 	persistDirectory        string
 	compress                bool
 	streamEmbeddingsOnQuery bool
+	hnsw                    *hnswIndex
+	hnswBuildLock           sync.Mutex
+	hnswVersion             atomic.Uint64
+	hnswIndexedVersion      atomic.Uint64
 
 	// ⚠️ When adding fields here, consider adding them to the persistence struct
 	// versions in [DB.Export] and [DB.Import] as well!
+}
+
+const hnswIndexFileName = "00000001.hidx"
+
+type persistedHNSWNode struct {
+	DocID     string
+	Level     int
+	Neighbors [][]int
+}
+
+type persistedHNSWIndex struct {
+	Dim            int
+	M              int
+	EFConstruction int
+	EFSearch       int
+	EntryPoint     int
+	MaxLevel       int
+	Deleted        []bool
+	DeletedBitmap  []uint64
+	Nodes          []persistedHNSWNode
 }
 
 // NegativeMode represents the mode to use for the negative text.
@@ -108,6 +133,7 @@ func newCollection(name string, metadata map[string]string, embed EmbeddingFunc,
 		embed:                   embed,
 		streamEmbeddingsOnQuery: streamEmbeddingsOnQuery,
 	}
+	c.hnswVersion.Store(1)
 
 	// Persistence
 	if dbDir != "" {
@@ -280,6 +306,7 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 	if c.persistDirectory != "" {
 		doc.persistPath = c.getDocPath(doc.ID)
 	}
+	_, existed := c.documents[doc.ID]
 	// We don't defer the unlock because we want to do it earlier.
 	c.documents[doc.ID] = &doc
 	c.docsListValid = false
@@ -299,6 +326,20 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 			}
 			c.documentsLock.Unlock()
 		}
+	}
+
+	upserted, err := c.tryIncrementalHNSWUpsert(&doc)
+	if err != nil {
+		return err
+	}
+	if !upserted {
+		c.markHNSWDirty()
+		c.removePersistedHNSWIndexBestEffort()
+	} else if existed {
+		// Keep docsList snapshot and index versions coherent after overwrite.
+		// Incremental upsert already advances index versions.
+	} else {
+		// Nothing else to do.
 	}
 
 	return nil
@@ -472,7 +513,6 @@ func (c *Collection) Delete(_ context.Context, where, whereDocument map[string]s
 	var docIDs []string
 
 	c.documentsLock.Lock()
-	defer c.documentsLock.Unlock()
 
 	if where != nil || whereDocument != nil {
 		// metadata + content filters
@@ -489,6 +529,7 @@ func (c *Collection) Delete(_ context.Context, where, whereDocument map[string]s
 
 	// No-op if no docs are left
 	if len(docIDs) == 0 {
+		c.documentsLock.Unlock()
 		return nil
 	}
 
@@ -500,13 +541,114 @@ func (c *Collection) Delete(_ context.Context, where, whereDocument map[string]s
 			docPath := c.getDocPath(docID)
 			err := removeFile(docPath)
 			if err != nil {
+				c.documentsLock.Unlock()
 				return fmt.Errorf("couldn't remove document at %q: %w", docPath, err)
 			}
 		}
 	}
 	c.docsListValid = false
+	c.documentsLock.Unlock()
+
+	deleted, err := c.tryIncrementalHNSWDelete(docIDs)
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		c.markHNSWDirty()
+		c.removePersistedHNSWIndexBestEffort()
+	}
 
 	return nil
+}
+
+func (c *Collection) markHNSWDirtyLocked() {
+	c.hnsw = nil
+	c.hnswVersion.Add(1)
+}
+
+func (c *Collection) markHNSWDirty() {
+	c.documentsLock.Lock()
+	c.markHNSWDirtyLocked()
+	c.documentsLock.Unlock()
+}
+
+func (c *Collection) tryIncrementalHNSWUpsert(doc *Document) (bool, error) {
+	if doc == nil || len(doc.Embedding) == 0 {
+		return false, nil
+	}
+	if !getHNSWEnabled() || c.streamEmbeddingsOnQuery {
+		return false, nil
+	}
+
+	c.hnswBuildLock.Lock()
+	defer c.hnswBuildLock.Unlock()
+
+	if c.hnsw == nil {
+		return false, nil
+	}
+	if c.hnswIndexedVersion.Load() != c.hnswVersion.Load() {
+		return false, nil
+	}
+	if len(doc.Embedding) != c.hnsw.dim {
+		return false, nil
+	}
+
+	nextIndex := c.hnsw.clone()
+	if err := nextIndex.upsert(doc); err != nil {
+		return false, fmt.Errorf("couldn't upsert document '%s' into hnsw index: %w", doc.ID, err)
+	}
+
+	newVersion := c.hnswVersion.Add(1)
+	c.hnsw = nextIndex
+	c.hnswIndexedVersion.Store(newVersion)
+	if err := c.persistHNSWIndex(nextIndex); err != nil {
+		return false, fmt.Errorf("couldn't persist hnsw index: %w", err)
+	}
+
+	return true, nil
+}
+
+func (c *Collection) tryIncrementalHNSWDelete(docIDs []string) (bool, error) {
+	if len(docIDs) == 0 || !getHNSWEnabled() || c.streamEmbeddingsOnQuery {
+		return false, nil
+	}
+
+	c.hnswBuildLock.Lock()
+	defer c.hnswBuildLock.Unlock()
+
+	if c.hnsw == nil {
+		return false, nil
+	}
+	if c.hnswIndexedVersion.Load() != c.hnswVersion.Load() {
+		return false, nil
+	}
+
+	nextIndex := c.hnsw.clone()
+	changed := false
+	for _, docID := range docIDs {
+		if nextIndex.markDeleted(docID) {
+			changed = true
+		}
+	}
+	if !changed {
+		return true, nil
+	}
+
+	newVersion := c.hnswVersion.Add(1)
+	c.hnsw = nextIndex
+	c.hnswIndexedVersion.Store(newVersion)
+	if err := c.persistHNSWIndex(nextIndex); err != nil {
+		return false, fmt.Errorf("couldn't persist hnsw index: %w", err)
+	}
+
+	return true, nil
+}
+
+func (c *Collection) removePersistedHNSWIndexBestEffort() {
+	if c.persistDirectory == "" {
+		return
+	}
+	_ = removeFile(c.getHNSWIndexPath())
 }
 
 // getDocumentsListLocked returns a cached snapshot of all document pointers.
@@ -702,10 +844,18 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	// For the remaining documents, get the most similar docs.
 	var nMaxDocs []docSim
 	var err error
-	if c.streamEmbeddingsOnQuery {
-		nMaxDocs, err = c.getMostSimilarDocsStreaming(ctx, queryEmbedding, negativeEmbeddings, negativeFilterThreshold, filteredDocs, resLen)
-	} else {
-		nMaxDocs, err = getMostSimilarDocs(ctx, queryEmbedding, negativeEmbeddings, negativeFilterThreshold, filteredDocs, resLen)
+	if c.canUseHNSW(where, whereDocument, negativeEmbeddings, negativeFilterThreshold) {
+		nMaxDocs, err = c.getMostSimilarDocsHNSW(queryEmbedding, resLen, filteredDocs)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't query hnsw index: %w", err)
+		}
+	}
+	if len(nMaxDocs) == 0 {
+		if c.streamEmbeddingsOnQuery {
+			nMaxDocs, err = c.getMostSimilarDocsStreaming(ctx, queryEmbedding, negativeEmbeddings, negativeFilterThreshold, filteredDocs, resLen)
+		} else {
+			nMaxDocs, err = getMostSimilarDocs(ctx, queryEmbedding, negativeEmbeddings, negativeFilterThreshold, filteredDocs, resLen)
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get most similar docs: %w", err)
@@ -734,6 +884,328 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	}
 
 	return res, nil
+}
+
+func (c *Collection) canUseHNSW(where, whereDocument map[string]string, negativeEmbeddings []float32, negativeFilterThreshold float32) bool {
+	if !getHNSWEnabled() {
+		return false
+	}
+	if c.streamEmbeddingsOnQuery {
+		return false
+	}
+	if len(where) > 0 || len(whereDocument) > 0 {
+		return false
+	}
+	if len(negativeEmbeddings) > 0 || negativeFilterThreshold > 0 {
+		return false
+	}
+	return true
+}
+
+func (c *Collection) getMostSimilarDocsHNSW(queryEmbedding []float32, nResults int, docs []*Document) ([]docSim, error) {
+	if nResults <= 0 || len(docs) == 0 {
+		return nil, nil
+	}
+
+	if err := c.ensureHNSWIndexReady(); err != nil {
+		return nil, err
+	}
+
+	c.hnswBuildLock.Lock()
+	idx := c.hnsw
+	c.hnswBuildLock.Unlock()
+	if idx == nil {
+		return nil, nil
+	}
+
+	if c.shouldCompactHNSW(idx) {
+		if err := c.compactHNSWIndex(); err != nil {
+			return nil, err
+		}
+		c.hnswBuildLock.Lock()
+		idx = c.hnsw
+		c.hnswBuildLock.Unlock()
+		if idx == nil {
+			return nil, nil
+		}
+	}
+
+	neighbors, err := idx.Search(queryEmbedding, nResults)
+	if err != nil {
+		return nil, err
+	}
+	if len(neighbors) < nResults {
+		return nil, nil
+	}
+
+	out := make([]docSim, 0, len(neighbors))
+	for _, n := range neighbors {
+		out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+	}
+
+	return out, nil
+}
+
+// shouldCompactHNSW returns true when the index has accumulated enough tombstones
+// that query quality/latency can degrade due to stale graph topology.
+//
+// We use a two-condition trigger:
+//  1. deleted nodes >= CHROMEM_HNSW_TOMBSTONE_REBUILD_MIN_DELETED
+//  2. deleted/total >= CHROMEM_HNSW_TOMBSTONE_REBUILD_RATIO
+//
+// This avoids frequent rebuilds on small collections while still recovering graph
+// quality for long-lived, mutation-heavy workloads.
+func (c *Collection) shouldCompactHNSW(idx *hnswIndex) bool {
+	if idx == nil {
+		return false
+	}
+
+	ratioThreshold := getHNSWTombstoneRebuildRatio()
+	if ratioThreshold <= 0 {
+		return false
+	}
+
+	deleted := idx.deletedCount()
+	if deleted == 0 || deleted < getHNSWTombstoneRebuildMinDeleted() {
+		return false
+	}
+
+	total := len(idx.nodes)
+	if total == 0 {
+		return false
+	}
+
+	ratio := float64(deleted) / float64(total)
+	return ratio >= ratioThreshold
+}
+
+// compactHNSWIndex compacts the current index by rebuilding it from live documents
+// only, removing tombstoned historical nodes.
+//
+// This function is intentionally called lazily from the query path so write-heavy
+// phases can stay fast (incremental upserts/deletes), while read phases regain
+// graph quality once tombstones grow beyond thresholds.
+func (c *Collection) compactHNSWIndex() error {
+	c.hnswBuildLock.Lock()
+	defer c.hnswBuildLock.Unlock()
+
+	idx := c.hnsw
+	if !c.shouldCompactHNSW(idx) {
+		return nil
+	}
+
+	if err := c.ensureAllDocumentEmbeddingsLoaded(); err != nil {
+		return err
+	}
+
+	c.documentsLock.RLock()
+	docSnapshot := slices.Clone(c.getDocumentsListLocked())
+	c.documentsLock.RUnlock()
+	if len(docSnapshot) == 0 {
+		c.hnsw = nil
+		c.hnswIndexedVersion.Store(c.hnswVersion.Load())
+		return nil
+	}
+
+	dim := len(docSnapshot[0].Embedding)
+	if dim == 0 {
+		return errors.New("couldn't compact hnsw index: first document embedding is empty")
+	}
+
+	newIndex := newHNSWIndex(dim, getHNSWM(), getHNSWEFConstruction(), getHNSWEFSearch())
+	if err := newIndex.Build(docSnapshot); err != nil {
+		return fmt.Errorf("couldn't compact hnsw index: %w", err)
+	}
+
+	currentVersion := c.hnswVersion.Load()
+	c.hnsw = newIndex
+	c.hnswIndexedVersion.Store(currentVersion)
+	if err := c.persistHNSWIndex(newIndex); err != nil {
+		return fmt.Errorf("couldn't persist compacted hnsw index: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Collection) ensureHNSWIndexReady() error {
+	currentVersion := c.hnswVersion.Load()
+	if c.hnswIndexedVersion.Load() == currentVersion {
+		c.hnswBuildLock.Lock()
+		ready := c.hnsw != nil
+		c.hnswBuildLock.Unlock()
+		if ready {
+			return nil
+		}
+	}
+
+	c.hnswBuildLock.Lock()
+	defer c.hnswBuildLock.Unlock()
+
+	currentVersion = c.hnswVersion.Load()
+	if c.hnswIndexedVersion.Load() == currentVersion && c.hnsw != nil {
+		return nil
+	}
+
+	if err := c.ensureAllDocumentEmbeddingsLoaded(); err != nil {
+		return err
+	}
+
+	c.documentsLock.RLock()
+	docSnapshot := slices.Clone(c.getDocumentsListLocked())
+	c.documentsLock.RUnlock()
+	if len(docSnapshot) == 0 {
+		c.hnsw = nil
+		c.hnswIndexedVersion.Store(currentVersion)
+		return nil
+	}
+
+	dim := len(docSnapshot[0].Embedding)
+	if dim == 0 {
+		return errors.New("couldn't build hnsw index: first document embedding is empty")
+	}
+
+	loaded, err := c.tryLoadPersistedHNSWIndex(docSnapshot, dim, currentVersion)
+	if err != nil {
+		return err
+	}
+	if loaded {
+		return nil
+	}
+
+	idx := newHNSWIndex(dim, getHNSWM(), getHNSWEFConstruction(), getHNSWEFSearch())
+	if err := idx.Build(docSnapshot); err != nil {
+		return err
+	}
+
+	currentVersion = c.hnswVersion.Load()
+	c.hnsw = idx
+	c.hnswIndexedVersion.Store(currentVersion)
+	_ = c.persistHNSWIndex(idx)
+
+	return nil
+}
+
+func (c *Collection) tryLoadPersistedHNSWIndex(docSnapshot []*Document, dim int, currentVersion uint64) (bool, error) {
+	if c.persistDirectory == "" {
+		return false, nil
+	}
+
+	persisted := persistedHNSWIndex{}
+	if err := readFromFile(c.getHNSWIndexPath(), &persisted, ""); err != nil {
+		return false, nil
+	}
+
+	if persisted.Dim != dim || len(persisted.Nodes) != len(docSnapshot) {
+		c.removePersistedHNSWIndexBestEffort()
+		return false, nil
+	}
+	deletedBitmap := persisted.DeletedBitmap
+	if len(deletedBitmap) == 0 && len(persisted.Deleted) > 0 {
+		for i, isDeleted := range persisted.Deleted {
+			if !isDeleted {
+				continue
+			}
+			wordIndex := i / 64
+			for len(deletedBitmap) <= wordIndex {
+				deletedBitmap = append(deletedBitmap, 0)
+			}
+			deletedBitmap[wordIndex] |= uint64(1) << uint(i%64)
+		}
+	}
+	requiredWords := (len(persisted.Nodes) + 63) / 64
+	if len(deletedBitmap) < requiredWords {
+		deletedBitmap = append(deletedBitmap, make([]uint64, requiredWords-len(deletedBitmap))...)
+	}
+
+	docByID := make(map[string]*Document, len(docSnapshot))
+	for _, doc := range docSnapshot {
+		docByID[doc.ID] = doc
+	}
+
+	nodes := make([]hnswNode, len(persisted.Nodes))
+	for i, node := range persisted.Nodes {
+		doc, ok := docByID[node.DocID]
+		if !ok {
+			c.removePersistedHNSWIndexBestEffort()
+			return false, nil
+		}
+		if node.Level < 0 || len(node.Neighbors) != node.Level+1 {
+			c.removePersistedHNSWIndexBestEffort()
+			return false, nil
+		}
+
+		neighbors := make([][]int, len(node.Neighbors))
+		for level := range node.Neighbors {
+			neighbors[level] = slices.Clone(node.Neighbors[level])
+			for _, neighborID := range neighbors[level] {
+				if neighborID < 0 || neighborID >= len(persisted.Nodes) {
+					c.removePersistedHNSWIndexBestEffort()
+					return false, nil
+				}
+			}
+		}
+
+		nodes[i] = hnswNode{doc: doc, level: node.Level, neighbors: neighbors}
+	}
+
+	if persisted.EntryPoint < -1 || persisted.EntryPoint >= len(nodes) {
+		c.removePersistedHNSWIndexBestEffort()
+		return false, nil
+	}
+
+	idx := newHNSWIndex(
+		persisted.Dim,
+		persisted.M,
+		persisted.EFConstruction,
+		persisted.EFSearch,
+	)
+	idx.nodes = nodes
+	idx.deletedBitmap = slices.Clone(deletedBitmap)
+	idx.entryPoint = persisted.EntryPoint
+	idx.maxLevel = persisted.MaxLevel
+	idx.latestNodeByDocID = make(map[string]int, len(nodes))
+	for i, node := range nodes {
+		if idx.isDeleted(i) {
+			continue
+		}
+		idx.latestNodeByDocID[node.doc.ID] = i
+	}
+
+	c.hnsw = idx
+	c.hnswIndexedVersion.Store(currentVersion)
+	return true, nil
+}
+
+func (c *Collection) persistHNSWIndex(idx *hnswIndex) error {
+	if c.persistDirectory == "" || idx == nil {
+		return nil
+	}
+
+	nodes := make([]persistedHNSWNode, 0, len(idx.nodes))
+	for _, node := range idx.nodes {
+		neighbors := make([][]int, len(node.neighbors))
+		for i := range node.neighbors {
+			neighbors[i] = slices.Clone(node.neighbors[i])
+		}
+		nodes = append(nodes, persistedHNSWNode{
+			DocID:     node.doc.ID,
+			Level:     node.level,
+			Neighbors: neighbors,
+		})
+	}
+
+	persisted := persistedHNSWIndex{
+		Dim:            idx.dim,
+		M:              idx.m,
+		EFConstruction: idx.efConstruction,
+		EFSearch:       idx.efSearch,
+		EntryPoint:     idx.entryPoint,
+		MaxLevel:       idx.maxLevel,
+		DeletedBitmap:  slices.Clone(idx.deletedBitmap),
+		Nodes:          nodes,
+	}
+
+	return persistToFile(c.getHNSWIndexPath(), persisted, c.compress, "")
 }
 
 func (c *Collection) ensureDocumentPayloadLoaded(doc *Document) error {
@@ -948,6 +1420,10 @@ func (c *Collection) getDocPath(docID string) string {
 		docPath += ".gz"
 	}
 	return docPath
+}
+
+func (c *Collection) getHNSWIndexPath() string {
+	return filepath.Join(c.persistDirectory, hnswIndexFileName)
 }
 
 // persistMetadata persists the collection metadata to disk

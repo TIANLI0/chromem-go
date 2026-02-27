@@ -22,6 +22,39 @@
 				"\"go test -run '^$' -bench '^BenchmarkCollection_Query_NoContent_1536_Approx1GiB_PersistentModes$' -benchmem -benchtime 1x -count 1 . | Out-File -FilePath bench_persistent_modes.txt -Encoding utf8\""
 			],
 			"isBackground": false
+		},
+		{
+			"label": "bench-hnsw-toggle-1g-simd",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"\"$env:GOEXPERIMENT='simd'; go test -run '^$' -bench '^BenchmarkCollection_Query_NoContent_1536_Approx1GiB_HNSWToggle$' -benchmem -benchtime 1x -count 1 .\""
+			],
+			"isBackground": false
+		},
+		{
+			"label": "bench-hnsw-toggle-1g-simd-once",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"\"$env:GOEXPERIMENT='simd'; go test -run '^$' -bench '^BenchmarkCollection_Query_NoContent_1536_Approx1GiB_HNSWToggle$' -benchmem -benchtime 1x -count 1 .\""
+			],
+			"isBackground": false
+		},
+		{
+			"label": "bench-hnsw-toggle-100k-simd-once",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"\"$env:GOEXPERIMENT='simd'; go test -run '^$' -bench '^BenchmarkCollection_Query_NoContent_1536_100k_HNSWToggle$' -benchmem -benchtime 1x -count 1 .\""
+			],
+			"isBackground": false
 		}
 	]
 }
