@@ -150,6 +150,7 @@ Compared to the upstream baseline at commit `f63964a64bf64b261f665dd45f92cafadcb
   - `CHROMEM_QUERY_SEQUENTIAL_DOCS_THRESHOLD`
   - `CHROMEM_QUERY_HIGH_DIM_THRESHOLD`
   - `CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR`
+  - `CHROMEM_QUERY_MAX_CONCURRENCY` (hard cap; `0` disables cap)
   - plus matching setter APIs (`SetQuery...`)
 - Optional SIMD path for dot product (amd64 + `GOEXPERIMENT=simd`) with runtime threshold control:
   - env var: `CHROMEM_SIMD_MIN_LENGTH`
@@ -380,6 +381,13 @@ The query path supports a SIMD-optimized dot product (Go `GOEXPERIMENT=simd`, AM
 - SIMD can be enabled for benchmarking via `GOEXPERIMENT=simd`.
 - The runtime threshold for switching from scalar to SIMD dot product can be configured with env var `CHROMEM_SIMD_MIN_LENGTH` or programmatically with `chromem.SetSIMDMinLength()`.
 - The default threshold is `1536`.
+- Query concurrency can be tuned with:
+  - `CHROMEM_QUERY_SMALL_DOCS_THRESHOLD`
+  - `CHROMEM_QUERY_SEQUENTIAL_DOCS_THRESHOLD`
+  - `CHROMEM_QUERY_HIGH_DIM_THRESHOLD`
+  - `CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR`
+  - `CHROMEM_QUERY_MAX_CONCURRENCY` (`0` means no hard cap)
+  - equivalent APIs: `SetQuerySmallDocsThreshold`, `SetQuerySequentialDocsThreshold`, `SetQueryHighDimThreshold`, `SetQueryHighDimConcurrencyDivisor`, `SetQueryMaxConcurrency`
 
 Based on benchmark runs on Intel i7-14700F:
 
@@ -388,6 +396,36 @@ Based on benchmark runs on Intel i7-14700F:
 - A practical default is `CHROMEM_SIMD_MIN_LENGTH=1536` for balanced single-core and multi-core performance on this hardware.
 
 For 1GiB / 1536-dim workloads, prefer running query concurrency around 4-8 workers for best throughput/latency tradeoff.
+
+#### Recommended presets (copy/paste)
+
+The following presets are good starting points for library users. Keep `CHROMEM_SIMD_MIN_LENGTH=1536` unless your benchmarks show a better value.
+
+- Low-latency API (stable p95/p99):
+  - `CHROMEM_QUERY_MAX_CONCURRENCY=4`
+  - `CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR=2`
+- Throughput-oriented batch/service:
+  - `CHROMEM_QUERY_MAX_CONCURRENCY=8`
+  - `CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR=2`
+- Conservative / unknown hardware:
+  - `CHROMEM_QUERY_MAX_CONCURRENCY=0` (no hard cap)
+  - `CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR=2`
+
+Programmatic equivalent:
+
+```go
+// Example: throughput-oriented profile.
+chromem.SetQueryMaxConcurrency(8)
+chromem.SetQueryHighDimConcurrencyDivisor(2)
+```
+
+Environment variables (no code changes in consuming app):
+
+```bash
+CHROMEM_SIMD_MIN_LENGTH=1536
+CHROMEM_QUERY_MAX_CONCURRENCY=8
+CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR=2
+```
 
 #### Reproducible matrix benchmark
 

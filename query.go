@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 var supportedFilters = []string{"$contains", "$not_contains"}
@@ -105,18 +104,24 @@ func queryConcurrency(numDocs int, vectorDim int) int {
 		return 0
 	}
 
-	numCPUs := runtime.NumCPU()
-	if numCPUs <= 1 {
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+	}
+	if numWorkers <= 1 {
 		return 1
 	}
 
-	concurrency := max(numCPUs/2, 1)
-	if numDocs < getQuerySmallDocsThreshold() {
-		concurrency = numCPUs
+	concurrency := numWorkers
+	if vectorDim >= getQueryHighDimThreshold() && numDocs >= getQuerySmallDocsThreshold() {
+		highDimThreshold := getQueryHighDimThreshold()
+		adaptiveMultiplier := max(vectorDim/highDimThreshold, 1)
+		adaptiveDivisor := min(getQueryHighDimConcurrencyDivisor()*adaptiveMultiplier, numWorkers)
+		concurrency = max(concurrency/adaptiveDivisor, 1)
 	}
 
-	if vectorDim >= getQueryHighDimThreshold() {
-		concurrency = max(concurrency/getQueryHighDimConcurrencyDivisor(), 1)
+	if maxConcurrency := getQueryMaxConcurrency(); maxConcurrency > 0 {
+		concurrency = min(concurrency, maxConcurrency)
 	}
 
 	return min(numDocs, concurrency)
@@ -133,6 +138,12 @@ func queryChunkSize(numDocs int) int {
 	default:
 		return 128
 	}
+}
+
+func workerRange(total, workers, workerIndex int) (int, int) {
+	start := workerIndex * total / workers
+	end := (workerIndex + 1) * total / workers
+	return start, end
 }
 
 // filterDocs filters a slice of documents by metadata and content.
@@ -165,20 +176,15 @@ func filterDocs(docs []*Document, where, whereDocument map[string]string) ([]*Do
 	}
 
 	chunkSize := queryChunkSize(numDocs)
-	var nextIndex atomic.Int64
 	resultsChan := make(chan []*Document, concurrency)
 
 	wg := sync.WaitGroup{}
-	for range concurrency {
+	for workerIndex := range concurrency {
 		wg.Go(func() {
 			localMatches := acquireDocumentSlice(0)
-			for {
-				start := int(nextIndex.Add(int64(chunkSize)) - int64(chunkSize))
-				if start >= numDocs {
-					break
-				}
-
-				end := min(start+chunkSize, numDocs)
+			workerStart, workerEnd := workerRange(numDocs, concurrency, workerIndex)
+			for start := workerStart; start < workerEnd; start += chunkSize {
+				end := min(start+chunkSize, workerEnd)
 				for _, doc := range docs[start:end] {
 					if documentMatchesFilters(doc, where, whereDocument) {
 						localMatches = append(localMatches, doc)
@@ -259,14 +265,16 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 			if len(doc.Embedding) != vectorDim {
 				return nil, fmt.Errorf("couldn't calculate similarity for document '%s': vectors must have the same length", doc.ID)
 			}
-			sim := dotProductOptimized(queryVectors, doc.Embedding)
 
+			sim := float32(0)
 			if negativeFilterThreshold > 0 {
-				nsim := dotProductOptimized(negativeVector, doc.Embedding)
-
+				nsim := float32(0)
+				sim, nsim = dotProductPairScalar(queryVectors, negativeVector, doc.Embedding)
 				if nsim > negativeFilterThreshold {
 					continue
 				}
+			} else {
+				sim = dotProductOptimized(queryVectors, doc.Embedding)
 			}
 
 			localMaxDocs.add(docSim{doc: doc, similarity: sim})
@@ -293,24 +301,19 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 	wg := sync.WaitGroup{}
 	resultsChan := make(chan []docSim, concurrency)
 	chunkSize := queryChunkSize(numDocs)
-	var nextIndex atomic.Int64
 	for i := range concurrency {
 
 		wg.Add(1)
 		go func(workerIndex int) {
 			defer wg.Done()
 			localMaxDocs := newMaxDocSims(n)
-			for {
+			workerStart, workerEnd := workerRange(numDocs, concurrency, workerIndex)
+			for start := workerStart; start < workerEnd; start += chunkSize {
 				if ctx.Err() != nil {
 					break
 				}
 
-				start := int(nextIndex.Add(int64(chunkSize)) - int64(chunkSize))
-				if start >= numDocs {
-					break
-				}
-
-				end := min(start+chunkSize, numDocs)
+				end := min(start+chunkSize, workerEnd)
 				for _, doc := range docs[start:end] {
 					if ctx.Err() != nil {
 						break
@@ -321,14 +324,16 @@ func getMostSimilarDocs(ctx context.Context, queryVectors, negativeVector []floa
 						setSharedErr(fmt.Errorf("couldn't calculate similarity for document '%s': vectors must have the same length", doc.ID))
 						break
 					}
-					sim := dotProductOptimized(queryVectors, doc.Embedding)
 
+					sim := float32(0)
 					if negativeFilterThreshold > 0 {
-						nsim := dotProductOptimized(negativeVector, doc.Embedding)
-
+						nsim := float32(0)
+						sim, nsim = dotProductPairScalar(queryVectors, negativeVector, doc.Embedding)
 						if nsim > negativeFilterThreshold {
 							continue
 						}
+					} else {
+						sim = dotProductOptimized(queryVectors, doc.Embedding)
 					}
 
 					localMaxDocs.add(docSim{doc: doc, similarity: sim})
