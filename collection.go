@@ -1,6 +1,7 @@
 package chromem
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -28,9 +29,15 @@ type Collection struct {
 	compress                bool
 	streamEmbeddingsOnQuery bool
 	hnsw                    *hnswIndex
+	ivf                     *ivfIndex
+	pq                      *pqIndex
+	ivfpq                   *ivfpqIndex
+	bm25                    *bm25Index
 	hnswBuildLock           sync.Mutex
 	hnswVersion             atomic.Uint64
 	hnswIndexedVersion      atomic.Uint64
+	annIndexedVersion       atomic.Uint64
+	bm25IndexedVersion      atomic.Uint64
 
 	// ⚠️ When adding fields here, consider adding them to the persistence struct
 	// versions in [DB.Export] and [DB.Import] as well!
@@ -563,6 +570,10 @@ func (c *Collection) Delete(_ context.Context, where, whereDocument map[string]s
 
 func (c *Collection) markHNSWDirtyLocked() {
 	c.hnsw = nil
+	c.ivf = nil
+	c.pq = nil
+	c.ivfpq = nil
+	c.bm25 = nil
 	c.hnswVersion.Add(1)
 }
 
@@ -716,12 +727,12 @@ func (c *Collection) Query(ctx context.Context, queryText string, nResults int, 
 		return nil, errors.New("queryText is empty")
 	}
 
-	queryVector, err := c.embed(ctx, queryText)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't create embedding of query: %w", err)
-	}
-
-	return c.QueryEmbedding(ctx, queryVector, nResults, where, whereDocument)
+	return c.QueryWithOptions(ctx, QueryOptions{
+		QueryText:     queryText,
+		NResults:      nResults,
+		Where:         where,
+		WhereDocument: whereDocument,
+	})
 }
 
 // QueryWithOptions performs an exhaustive nearest neighbor search on the collection.
@@ -768,7 +779,7 @@ func (c *Collection) QueryWithOptions(ctx context.Context, options QueryOptions)
 		}
 	}
 
-	result, err := c.queryEmbedding(ctx, queryVector, negativeVector, negativeFilterThreshold, options.NResults, options.Where, options.WhereDocument)
+	result, err := c.queryEmbedding(ctx, queryVector, negativeVector, negativeFilterThreshold, options.NResults, options.Where, options.WhereDocument, options.QueryText)
 	if err != nil {
 		return nil, err
 	}
@@ -786,11 +797,11 @@ func (c *Collection) QueryWithOptions(ctx context.Context, options QueryOptions)
 //   - where: Conditional filtering on metadata. Optional.
 //   - whereDocument: Conditional filtering on documents. Optional.
 func (c *Collection) QueryEmbedding(ctx context.Context, queryEmbedding []float32, nResults int, where, whereDocument map[string]string) ([]Result, error) {
-	return c.queryEmbedding(ctx, queryEmbedding, nil, 0, nResults, where, whereDocument)
+	return c.queryEmbedding(ctx, queryEmbedding, nil, 0, nResults, where, whereDocument, "")
 }
 
 // queryEmbedding performs an exhaustive nearest neighbor search on the collection.
-func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativeEmbeddings []float32, negativeFilterThreshold float32, nResults int, where, whereDocument map[string]string) ([]Result, error) {
+func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativeEmbeddings []float32, negativeFilterThreshold float32, nResults int, where, whereDocument map[string]string, queryText string) ([]Result, error) {
 	if len(queryEmbedding) == 0 {
 		return nil, errors.New("queryEmbedding is empty")
 	}
@@ -841,13 +852,27 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	// we only need to find the most similar docs among the filtered ones.
 	resLen := min(len(filteredDocs), nResults)
 
+	indexType := getANNIndexType()
+
 	// For the remaining documents, get the most similar docs.
 	var nMaxDocs []docSim
 	var err error
-	if c.canUseHNSW(where, whereDocument, negativeEmbeddings, negativeFilterThreshold) {
-		nMaxDocs, err = c.getMostSimilarDocsHNSW(queryEmbedding, resLen, filteredDocs)
+	if indexType == annIndexTypeBM25 && queryText != "" {
+		nMaxDocs, err = c.getMostRelevantDocsBM25(queryText, resLen)
 		if err != nil {
-			return nil, fmt.Errorf("couldn't query hnsw index: %w", err)
+			return nil, fmt.Errorf("couldn't query bm25 index: %w", err)
+		}
+		nMaxDocs = filterDocSimsByAllowedDocs(nMaxDocs, filteredDocs, resLen)
+	}
+
+	if len(nMaxDocs) == 0 && c.canUseANN(where, whereDocument, negativeEmbeddings, negativeFilterThreshold) {
+		vectorResults := resLen
+		if indexType == annIndexTypeHybrid && queryText != "" {
+			vectorResults = max(resLen*4, resLen)
+		}
+		nMaxDocs, err = c.getMostSimilarDocsANN(queryEmbedding, vectorResults, filteredDocs)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't query ann index: %w", err)
 		}
 	}
 	if len(nMaxDocs) == 0 {
@@ -859,6 +884,15 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	}
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get most similar docs: %w", err)
+	}
+
+	if indexType == annIndexTypeHybrid && queryText != "" && len(nMaxDocs) > 0 {
+		bm25Neighbors, bm25Err := c.getMostRelevantDocsBM25(queryText, max(resLen*4, resLen))
+		if bm25Err != nil {
+			return nil, fmt.Errorf("couldn't query bm25 index for hybrid rerank: %w", bm25Err)
+		}
+		bm25Neighbors = filterDocSimsByAllowedDocs(bm25Neighbors, filteredDocs, max(resLen*4, resLen))
+		nMaxDocs = hybridRerankDocSims(nMaxDocs, bm25Neighbors, resLen)
 	}
 
 	res := make([]Result, 0, len(nMaxDocs))
@@ -886,10 +920,7 @@ func (c *Collection) queryEmbedding(ctx context.Context, queryEmbedding, negativ
 	return res, nil
 }
 
-func (c *Collection) canUseHNSW(where, whereDocument map[string]string, negativeEmbeddings []float32, negativeFilterThreshold float32) bool {
-	if !getHNSWEnabled() {
-		return false
-	}
+func (c *Collection) canUseANN(where, whereDocument map[string]string, negativeEmbeddings []float32, negativeFilterThreshold float32) bool {
 	if c.streamEmbeddingsOnQuery {
 		return false
 	}
@@ -899,7 +930,167 @@ func (c *Collection) canUseHNSW(where, whereDocument map[string]string, negative
 	if len(negativeEmbeddings) > 0 || negativeFilterThreshold > 0 {
 		return false
 	}
-	return true
+
+	switch getANNIndexType() {
+	case annIndexTypeHNSW:
+		return getHNSWEnabled()
+	case annIndexTypeIVF, annIndexTypePQ, annIndexTypeIVFPQ, annIndexTypeHybrid:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Collection) getMostSimilarDocsANN(queryEmbedding []float32, nResults int, docs []*Document) ([]docSim, error) {
+	switch getANNIndexType() {
+	case annIndexTypeIVF:
+		neighbors, err := c.searchIVF(queryEmbedding, nResults)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]docSim, 0, len(neighbors))
+		for _, n := range neighbors {
+			out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+		}
+		if len(out) < nResults {
+			return nil, nil
+		}
+		return out, nil
+	case annIndexTypePQ:
+		neighbors, err := c.searchPQ(queryEmbedding, nResults)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]docSim, 0, len(neighbors))
+		for _, n := range neighbors {
+			out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+		}
+		if len(out) < nResults {
+			return nil, nil
+		}
+		return out, nil
+	case annIndexTypeIVFPQ:
+		neighbors, err := c.searchIVFPQ(queryEmbedding, nResults)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]docSim, 0, len(neighbors))
+		for _, n := range neighbors {
+			out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+		}
+		if len(out) < nResults {
+			return nil, nil
+		}
+		return out, nil
+	case annIndexTypeHybrid:
+		return c.getMostSimilarDocsHNSW(queryEmbedding, nResults, docs)
+	default:
+		return c.getMostSimilarDocsHNSW(queryEmbedding, nResults, docs)
+	}
+}
+
+func (c *Collection) getMostRelevantDocsBM25(queryText string, nResults int) ([]docSim, error) {
+	if nResults <= 0 || queryText == "" {
+		return nil, nil
+	}
+	if err := c.ensureBM25IndexReady(); err != nil {
+		return nil, err
+	}
+
+	c.hnswBuildLock.Lock()
+	idx := c.bm25
+	c.hnswBuildLock.Unlock()
+	if idx == nil {
+		return nil, nil
+	}
+
+	neighbors := idx.Search(queryText, nResults)
+	out := make([]docSim, 0, len(neighbors))
+	for _, n := range neighbors {
+		out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+	}
+	return out, nil
+}
+
+func filterDocSimsByAllowedDocs(items []docSim, allowedDocs []*Document, limit int) []docSim {
+	if len(items) == 0 || len(allowedDocs) == 0 || limit <= 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(allowedDocs))
+	for _, doc := range allowedDocs {
+		allowed[doc.ID] = struct{}{}
+	}
+
+	out := make([]docSim, 0, min(limit, len(items)))
+	for _, item := range items {
+		if item.doc == nil {
+			continue
+		}
+		if _, ok := allowed[item.doc.ID]; !ok {
+			continue
+		}
+		out = append(out, item)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func hybridRerankDocSims(vectorNeighbors, bm25Neighbors []docSim, k int) []docSim {
+	if k <= 0 || len(vectorNeighbors) == 0 {
+		return nil
+	}
+
+	type fusedItem struct {
+		doc        *Document
+		similarity float32
+		score      float64
+	}
+
+	fused := make(map[string]fusedItem, len(vectorNeighbors)+len(bm25Neighbors))
+	for rank, item := range vectorNeighbors {
+		if item.doc == nil {
+			continue
+		}
+		vecNorm := float64((item.similarity + 1) / 2)
+		rankBoost := 1.0 / float64(rank+1)
+		combined := 0.85*vecNorm + 0.15*rankBoost
+		fused[item.doc.ID] = fusedItem{doc: item.doc, similarity: item.similarity, score: combined}
+	}
+
+	for rank, item := range bm25Neighbors {
+		if item.doc == nil {
+			continue
+		}
+		bmNorm := float64(max(min(item.similarity, 1), 0))
+		rankBoost := 1.0 / float64(rank+1)
+		lexScore := 0.7*bmNorm + 0.3*rankBoost
+		if existing, ok := fused[item.doc.ID]; ok {
+			existing.score = 0.75*existing.score + 0.25*lexScore
+			fused[item.doc.ID] = existing
+			continue
+		}
+		fused[item.doc.ID] = fusedItem{doc: item.doc, similarity: item.similarity, score: 0.25 * lexScore}
+	}
+
+	ranked := make([]fusedItem, 0, len(fused))
+	for _, item := range fused {
+		ranked = append(ranked, item)
+	}
+	slices.SortFunc(ranked, func(a, b fusedItem) int {
+		return cmp.Compare(b.score, a.score)
+	})
+
+	if len(ranked) > k {
+		ranked = ranked[:k]
+	}
+
+	out := make([]docSim, 0, len(ranked))
+	for _, item := range ranked {
+		out = append(out, docSim{doc: item.doc, similarity: item.similarity})
+	}
+	return out
 }
 
 func (c *Collection) getMostSimilarDocsHNSW(queryEmbedding []float32, nResults int, docs []*Document) ([]docSim, error) {
@@ -934,16 +1125,257 @@ func (c *Collection) getMostSimilarDocsHNSW(queryEmbedding []float32, nResults i
 	if err != nil {
 		return nil, err
 	}
+	rerankTopN := getHNSWExactRerankTopN()
+	if rerankTopN > nResults {
+		neighbors, err = idx.Search(queryEmbedding, rerankTopN)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(neighbors) < nResults {
 		return nil, nil
 	}
 
 	out := make([]docSim, 0, len(neighbors))
 	for _, n := range neighbors {
-		out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+		if n.doc == nil {
+			continue
+		}
+		exactSim := dotProductOptimized(queryEmbedding, n.doc.Embedding)
+		out = append(out, docSim{doc: n.doc, similarity: exactSim})
+	}
+
+	slices.SortFunc(out, func(a, b docSim) int {
+		return cmp.Compare(b.similarity, a.similarity)
+	})
+	if len(out) > nResults {
+		out = out[:nResults]
 	}
 
 	return out, nil
+}
+
+func (c *Collection) searchIVF(queryEmbedding []float32, nResults int) ([]hnswNeighbor, error) {
+	if nResults <= 0 {
+		return nil, nil
+	}
+	if err := c.ensureIVFIndexReady(); err != nil {
+		return nil, err
+	}
+
+	c.hnswBuildLock.Lock()
+	idx := c.ivf
+	c.hnswBuildLock.Unlock()
+	if idx == nil {
+		return nil, nil
+	}
+
+	return idx.Search(queryEmbedding, nResults)
+}
+
+func (c *Collection) searchPQ(queryEmbedding []float32, nResults int) ([]hnswNeighbor, error) {
+	if nResults <= 0 {
+		return nil, nil
+	}
+	if err := c.ensurePQIndexReady(); err != nil {
+		return nil, err
+	}
+
+	c.hnswBuildLock.Lock()
+	idx := c.pq
+	c.hnswBuildLock.Unlock()
+	if idx == nil {
+		return nil, nil
+	}
+
+	return idx.Search(queryEmbedding, nResults)
+}
+
+func (c *Collection) searchIVFPQ(queryEmbedding []float32, nResults int) ([]hnswNeighbor, error) {
+	if nResults <= 0 {
+		return nil, nil
+	}
+	if err := c.ensureIVFPQIndexReady(); err != nil {
+		return nil, err
+	}
+
+	c.hnswBuildLock.Lock()
+	idx := c.ivfpq
+	c.hnswBuildLock.Unlock()
+	if idx == nil {
+		return nil, nil
+	}
+
+	return idx.Search(queryEmbedding, nResults)
+}
+
+func (c *Collection) ensureIVFIndexReady() error {
+	currentVersion := c.hnswVersion.Load()
+	if c.annIndexedVersion.Load() == currentVersion {
+		c.hnswBuildLock.Lock()
+		ready := c.ivf != nil
+		c.hnswBuildLock.Unlock()
+		if ready {
+			return nil
+		}
+	}
+
+	c.hnswBuildLock.Lock()
+	defer c.hnswBuildLock.Unlock()
+
+	currentVersion = c.hnswVersion.Load()
+	if c.annIndexedVersion.Load() == currentVersion && c.ivf != nil {
+		return nil
+	}
+
+	if err := c.ensureAllDocumentEmbeddingsLoaded(); err != nil {
+		return err
+	}
+
+	c.documentsLock.RLock()
+	docSnapshot := slices.Clone(c.getDocumentsListLocked())
+	c.documentsLock.RUnlock()
+	if len(docSnapshot) == 0 {
+		c.ivf = nil
+		c.annIndexedVersion.Store(currentVersion)
+		return nil
+	}
+
+	dim := len(docSnapshot[0].Embedding)
+	idx := newIVFIndex(dim, getANNIVFNList(), getANNIVFNProbe())
+	if err := idx.Build(docSnapshot); err != nil {
+		return fmt.Errorf("couldn't build ivf index: %w", err)
+	}
+
+	c.ivf = idx
+	c.annIndexedVersion.Store(currentVersion)
+	return nil
+}
+
+func (c *Collection) ensurePQIndexReady() error {
+	currentVersion := c.hnswVersion.Load()
+	if c.annIndexedVersion.Load() == currentVersion {
+		c.hnswBuildLock.Lock()
+		ready := c.pq != nil
+		c.hnswBuildLock.Unlock()
+		if ready {
+			return nil
+		}
+	}
+
+	c.hnswBuildLock.Lock()
+	defer c.hnswBuildLock.Unlock()
+
+	currentVersion = c.hnswVersion.Load()
+	if c.annIndexedVersion.Load() == currentVersion && c.pq != nil {
+		return nil
+	}
+
+	if err := c.ensureAllDocumentEmbeddingsLoaded(); err != nil {
+		return err
+	}
+
+	c.documentsLock.RLock()
+	docSnapshot := slices.Clone(c.getDocumentsListLocked())
+	c.documentsLock.RUnlock()
+	if len(docSnapshot) == 0 {
+		c.pq = nil
+		c.annIndexedVersion.Store(currentVersion)
+		return nil
+	}
+
+	dim := len(docSnapshot[0].Embedding)
+	idx := newPQIndex(dim, getANNPQM(), getANNPQNBits())
+	if err := idx.Build(docSnapshot); err != nil {
+		return fmt.Errorf("couldn't build pq index: %w", err)
+	}
+
+	c.pq = idx
+	c.annIndexedVersion.Store(currentVersion)
+	return nil
+}
+
+func (c *Collection) ensureIVFPQIndexReady() error {
+	currentVersion := c.hnswVersion.Load()
+	if c.annIndexedVersion.Load() == currentVersion {
+		c.hnswBuildLock.Lock()
+		ready := c.ivfpq != nil
+		c.hnswBuildLock.Unlock()
+		if ready {
+			return nil
+		}
+	}
+
+	c.hnswBuildLock.Lock()
+	defer c.hnswBuildLock.Unlock()
+
+	currentVersion = c.hnswVersion.Load()
+	if c.annIndexedVersion.Load() == currentVersion && c.ivfpq != nil {
+		return nil
+	}
+
+	if err := c.ensureAllDocumentEmbeddingsLoaded(); err != nil {
+		return err
+	}
+
+	c.documentsLock.RLock()
+	docSnapshot := slices.Clone(c.getDocumentsListLocked())
+	c.documentsLock.RUnlock()
+	if len(docSnapshot) == 0 {
+		c.ivfpq = nil
+		c.annIndexedVersion.Store(currentVersion)
+		return nil
+	}
+
+	dim := len(docSnapshot[0].Embedding)
+	idx := newIVFPQIndex(dim, getANNIVFPQNList(), getANNIVFPQNProbe(), getANNIVFPQM(), getANNIVFPQNBits())
+	if err := idx.Build(docSnapshot); err != nil {
+		return fmt.Errorf("couldn't build ivfpq index: %w", err)
+	}
+
+	c.ivfpq = idx
+	c.annIndexedVersion.Store(currentVersion)
+	return nil
+}
+
+func (c *Collection) ensureBM25IndexReady() error {
+	currentVersion := c.hnswVersion.Load()
+	if c.bm25IndexedVersion.Load() == currentVersion {
+		c.hnswBuildLock.Lock()
+		ready := c.bm25 != nil
+		c.hnswBuildLock.Unlock()
+		if ready {
+			return nil
+		}
+	}
+
+	c.hnswBuildLock.Lock()
+	defer c.hnswBuildLock.Unlock()
+
+	currentVersion = c.hnswVersion.Load()
+	if c.bm25IndexedVersion.Load() == currentVersion && c.bm25 != nil {
+		return nil
+	}
+
+	if err := c.ensureAllDocumentPayloadLoaded(); err != nil {
+		return err
+	}
+
+	c.documentsLock.RLock()
+	docSnapshot := slices.Clone(c.getDocumentsListLocked())
+	c.documentsLock.RUnlock()
+	if len(docSnapshot) == 0 {
+		c.bm25 = nil
+		c.bm25IndexedVersion.Store(currentVersion)
+		return nil
+	}
+
+	idx := newBM25Index()
+	idx.Build(docSnapshot)
+
+	c.bm25 = idx
+	c.bm25IndexedVersion.Store(currentVersion)
+	return nil
 }
 
 // shouldCompactHNSW returns true when the index has accumulated enough tombstones

@@ -7,6 +7,7 @@ func TestHNSWTuningSetters(t *testing.T) {
 	oldM := getHNSWM()
 	oldEFC := getHNSWEFConstruction()
 	oldEFS := getHNSWEFSearch()
+	oldExactRerankTopN := getHNSWExactRerankTopN()
 	oldTombstoneRatio := getHNSWTombstoneRebuildRatio()
 	oldTombstoneMinDeleted := getHNSWTombstoneRebuildMinDeleted()
 
@@ -15,6 +16,7 @@ func TestHNSWTuningSetters(t *testing.T) {
 		SetHNSWM(oldM)
 		SetHNSWEFConstruction(oldEFC)
 		SetHNSWEFSearch(oldEFS)
+		SetHNSWExactRerankTopN(oldExactRerankTopN)
 		SetHNSWTombstoneRebuildRatio(oldTombstoneRatio)
 		SetHNSWTombstoneRebuildMinDeleted(oldTombstoneMinDeleted)
 	})
@@ -54,6 +56,19 @@ func TestHNSWTuningSetters(t *testing.T) {
 	SetHNSWEFSearch(0)
 	if got := getHNSWEFSearch(); got != 96 {
 		t.Fatalf("invalid HNSW efSearch should be ignored, got %d", got)
+	}
+
+	SetHNSWExactRerankTopN(128)
+	if got := getHNSWExactRerankTopN(); got != 128 {
+		t.Fatalf("expected HNSW exact rerank topN=128, got %d", got)
+	}
+	SetHNSWExactRerankTopN(-1)
+	if got := getHNSWExactRerankTopN(); got != 128 {
+		t.Fatalf("invalid HNSW exact rerank topN should be ignored, got %d", got)
+	}
+	SetHNSWExactRerankTopN(0)
+	if got := getHNSWExactRerankTopN(); got != 0 {
+		t.Fatalf("expected HNSW exact rerank topN=0 (disabled), got %d", got)
 	}
 
 	SetHNSWTombstoneRebuildRatio(0.35)

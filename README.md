@@ -13,7 +13,7 @@ Because `chromem-go` is embeddable it enables you to add retrieval augmented gen
 
 It's *not* a library to connect to Chroma and also not a reimplementation of it in Go. It's a database on its own.
 
-The focus is not scale (millions of documents) or number of features, but simplicity and performance for the most common use cases. This fork adds post-`f63964a64bf64b261f665dd45f92cafadcb0b972` query-path optimizations and SIMD controls; see [Differences vs upstream (after `f63964a`)](#differences-vs-upstream-after-f63964a) and [Benchmarks](#benchmarks).
+The focus is not scale (millions of documents) or number of features, but simplicity and performance for the most common use cases. This fork adds post-`f63964a64bf64b261f665dd45f92cafadcb0b972` query-path optimizations, SIMD controls, and multiple ANN / lexical retrieval modes; see [Differences vs upstream (after `f63964a`)](#differences-vs-upstream-after-f63964a) and [Benchmarks](#benchmarks).
 
 > ⚠️ The project is in beta, under heavy construction, and may introduce breaking changes in releases before `v1.0.0`. All changes are documented in the [`CHANGELOG`](./CHANGELOG.md).
 
@@ -155,6 +155,17 @@ Compared to the upstream baseline at commit `f63964a64bf64b261f665dd45f92cafadcb
 - Optional SIMD path for dot product (amd64 + `GOEXPERIMENT=simd`) with runtime threshold control:
   - env var: `CHROMEM_SIMD_MIN_LENGTH`
   - API: `SetSIMDMinLength()`
+- Additional retrieval/index modes configurable at runtime:
+  - `hnsw` (default ANN)
+  - `ivf`
+  - `pq`
+  - `ivfpq`
+  - `bm25` (lexical)
+  - `hybrid` (vector + BM25 rerank)
+- HNSW internals reworked for better hot-path behavior:
+  - SIMD-aware distance kernel integration
+  - allocation reduction with visited/heap pools
+  - graph build/search logic split by responsibility for maintainability
 - Collection-level memory observability API:
   - `Collection.MemoryStats()`
 - Reproducible benchmark workflow and matrix script:
@@ -263,6 +274,13 @@ After choosing a mode, re-run the benchmark with your real filters/content mix a
   - You can also pass existing embeddings when adding documents to a collection, instead of letting `chromem-go` create them
 - Similarity search:
   - [X] Exhaustive nearest neighbor search using cosine similarity (sometimes also called exact search or brute-force search or FLAT index)
+  - [X] Approximate nearest neighbor search (ANN)
+    - [X] Hierarchical Navigable Small World (HNSW)
+    - [X] Inverted File (IVF)
+    - [X] Product Quantization (PQ)
+    - [X] Inverted File + Product Quantization (IVFPQ)
+  - [X] Lexical search with BM25 (`CHROMEM_INDEX_TYPE=bm25`)
+  - [X] Hybrid rerank (vector ANN + BM25, `CHROMEM_INDEX_TYPE=hybrid`)
 - Filters:
   - [X] Document filters: `$contains`, `$not_contains`
   - [X] Metadata filters: Exact matches
@@ -284,9 +302,8 @@ After choosing a mode, re-run the benchmark with your real filters/content mix a
 - Embedding creators:
   - Add an `EmbeddingFunc` that downloads and shells out to [llamafile](https://github.com/Mozilla-Ocho/llamafile)
 - Similarity search:
-  - Approximate nearest neighbor search with index (ANN)
-    - Hierarchical Navigable Small World (HNSW)
-    - Inverted file flat (IVFFlat)
+  - Continue improving ANN recall/latency trade-offs and defaults per workload
+  - Add more benchmark presets for hybrid (vector + lexical) workloads
 - Filters:
   - Operators (`$and`, `$or` etc.)
 - Storage:
@@ -429,11 +446,18 @@ The query path supports a SIMD-optimized dot product (Go `GOEXPERIMENT=simd`, AM
 - HNSW index behavior can be tuned with:
   - `CHROMEM_HNSW_ENABLED` (`true`/`false`, default `true`)
   - `CHROMEM_HNSW_M` (default `16`)
-  - `CHROMEM_HNSW_EF_CONSTRUCTION` (default `128`)
-  - `CHROMEM_HNSW_EF_SEARCH` (default `64`)
+  - `CHROMEM_HNSW_EF_CONSTRUCTION` (default `200`)
+  - `CHROMEM_HNSW_EF_SEARCH` (default `200`)
+  - `CHROMEM_HNSW_EXACT_RERANK_TOPN` (default `0`, disabled)
   - `CHROMEM_HNSW_TOMBSTONE_REBUILD_RATIO` (default `0.2`, `0` disables auto-compaction)
   - `CHROMEM_HNSW_TOMBSTONE_REBUILD_MIN_DELETED` (default `2048`)
-  - equivalent APIs: `SetHNSWEnabled`, `SetHNSWM`, `SetHNSWEFConstruction`, `SetHNSWEFSearch`, `SetHNSWTombstoneRebuildRatio`, `SetHNSWTombstoneRebuildMinDeleted`
+  - equivalent APIs: `SetHNSWEnabled`, `SetHNSWM`, `SetHNSWEFConstruction`, `SetHNSWEFSearch`, `SetHNSWExactRerankTopN`, `SetHNSWTombstoneRebuildRatio`, `SetHNSWTombstoneRebuildMinDeleted`
+- ANN / lexical mode selection can be tuned with env vars:
+  - `CHROMEM_INDEX_TYPE` (`hnsw` | `ivf` | `pq` | `ivfpq` | `bm25` | `hybrid`)
+  - IVF: `CHROMEM_IVF_NLIST`, `CHROMEM_IVF_NPROBE`
+  - PQ: `CHROMEM_PQ_M`, `CHROMEM_PQ_NBITS`
+  - IVFPQ: `CHROMEM_IVFPQ_NLIST`, `CHROMEM_IVFPQ_NPROBE`, `CHROMEM_IVFPQ_M`, `CHROMEM_IVFPQ_NBITS`
+  - `bm25` / `hybrid` require query text input (e.g. via `QueryWithOptions{QueryText: ...}`)
 - Persistent DB startup memory can be reduced with `NewPersistentDBWithOptions(..., PersistentDBOptions{LazyLoadPayload: true})`, which keeps embeddings in memory and loads content/metadata on demand.
 - For an ultra-low-memory mode, set `StreamEmbeddingsOnQuery: true` to stream embeddings from disk during query instead of keeping them resident.
 
@@ -479,6 +503,7 @@ chromem.SetHNSWEnabled(true)
 chromem.SetHNSWM(24)
 chromem.SetHNSWEFConstruction(256)
 chromem.SetHNSWEFSearch(96)
+chromem.SetHNSWExactRerankTopN(128)
 chromem.SetHNSWTombstoneRebuildRatio(0.2)
 chromem.SetHNSWTombstoneRebuildMinDeleted(2048)
 ```
@@ -489,10 +514,20 @@ Environment variables (no code changes in consuming app):
 CHROMEM_SIMD_MIN_LENGTH=1536
 CHROMEM_QUERY_MAX_CONCURRENCY=8
 CHROMEM_QUERY_HIGH_DIM_CONCURRENCY_DIVISOR=2
+CHROMEM_INDEX_TYPE=hnsw
+CHROMEM_IVF_NLIST=64
+CHROMEM_IVF_NPROBE=8
+CHROMEM_PQ_M=8
+CHROMEM_PQ_NBITS=8
+CHROMEM_IVFPQ_NLIST=64
+CHROMEM_IVFPQ_NPROBE=8
+CHROMEM_IVFPQ_M=8
+CHROMEM_IVFPQ_NBITS=8
 CHROMEM_HNSW_ENABLED=true
 CHROMEM_HNSW_M=16
-CHROMEM_HNSW_EF_CONSTRUCTION=128
-CHROMEM_HNSW_EF_SEARCH=64
+CHROMEM_HNSW_EF_CONSTRUCTION=200
+CHROMEM_HNSW_EF_SEARCH=200
+CHROMEM_HNSW_EXACT_RERANK_TOPN=0
 CHROMEM_HNSW_TOMBSTONE_REBUILD_RATIO=0.2
 CHROMEM_HNSW_TOMBSTONE_REBUILD_MIN_DELETED=2048
 ```

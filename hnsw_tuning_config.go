@@ -11,28 +11,41 @@ import (
 const (
 	defaultHNSWEnabled                    = true
 	defaultHNSWM                          = 16
-	defaultHNSWEFConstruction             = 128
-	defaultHNSWEFSearch                   = 64
+	defaultHNSWEFConstruction             = 200
+	defaultHNSWEFSearch                   = 200
+	defaultHNSWExactRerankTopN            = 0
 	defaultHNSWTombstoneRebuildRatio      = 0.2
 	defaultHNSWTombstoneRebuildMinDeleted = 2048
 )
 
+// HNSW tuning parameters are stored in atomic variables to allow dynamic updates at runtime without locking.
 var hnswEnabledFlag atomic.Bool
+
+// HNSW parameters:
+// M controls the maximum number of connections per node per layer. Higher M can improve recall but increases index size and build time.
+// EFConstruction controls the size of the candidate list during index construction. Higher values can improve recall but increase build time and memory usage.
+// EFSearch controls the size of the candidate list during search. Higher values can improve recall but increase search latency.
+// TombstoneRebuildRatio sets the ratio of deleted nodes to total nodes that triggers a graph compaction rebuild when exceeded.
+// TombstoneRebuildMinDeleted sets the minimum number of deleted nodes required before ratio-based compaction can trigger.
 var hnswMValue atomic.Int64
 var hnswEFConstructionValue atomic.Int64
 var hnswEFSearchValue atomic.Int64
+var hnswExactRerankTopNValue atomic.Int64
 var hnswTombstoneRebuildRatioBits atomic.Uint64
 var hnswTombstoneRebuildMinDeletedValue atomic.Int64
 
+// init reads HNSW tuning parameters from environment variables or uses defaults if not set or invalid.
 func init() {
 	hnswEnabledFlag.Store(readHNSWBoolEnvOrDefault("CHROMEM_HNSW_ENABLED", defaultHNSWEnabled))
 	hnswMValue.Store(int64(readHNSWPositiveEnvOrDefault("CHROMEM_HNSW_M", defaultHNSWM)))
 	hnswEFConstructionValue.Store(int64(readHNSWPositiveEnvOrDefault("CHROMEM_HNSW_EF_CONSTRUCTION", defaultHNSWEFConstruction)))
 	hnswEFSearchValue.Store(int64(readHNSWPositiveEnvOrDefault("CHROMEM_HNSW_EF_SEARCH", defaultHNSWEFSearch)))
+	hnswExactRerankTopNValue.Store(int64(readHNSWNonNegativeEnvOrDefault("CHROMEM_HNSW_EXACT_RERANK_TOPN", defaultHNSWExactRerankTopN)))
 	hnswTombstoneRebuildRatioBits.Store(math.Float64bits(readHNSWFloatRangeEnvOrDefault("CHROMEM_HNSW_TOMBSTONE_REBUILD_RATIO", defaultHNSWTombstoneRebuildRatio, 0, 1)))
 	hnswTombstoneRebuildMinDeletedValue.Store(int64(readHNSWNonNegativeEnvOrDefault("CHROMEM_HNSW_TOMBSTONE_REBUILD_MIN_DELETED", defaultHNSWTombstoneRebuildMinDeleted)))
 }
 
+// HNSW tuning parameter getters and setters allow dynamic updates at runtime. Setters validate inputs and ignore invalid values, while getters return the current effective values.
 func readHNSWBoolEnvOrDefault(name string, defaultValue bool) bool {
 	value, ok := os.LookupEnv(name)
 	if !ok {
@@ -74,6 +87,17 @@ func SetHNSWEFSearch(ef int) {
 	hnswEFSearchValue.Store(int64(ef))
 }
 
+// SetHNSWExactRerankTopN sets two-stage query reranking candidate count.
+//
+//	0  disables exact reranking.
+//	>0 enables exact reranking on up to top-N ANN candidates.
+func SetHNSWExactRerankTopN(topN int) {
+	if topN < 0 {
+		return
+	}
+	hnswExactRerankTopNValue.Store(int64(topN))
+}
+
 // SetHNSWTombstoneRebuildRatio sets the deleted-node ratio threshold that triggers
 // a graph compaction rebuild. Values outside [0,1] are ignored.
 //
@@ -109,6 +133,10 @@ func getHNSWEFConstruction() int {
 
 func getHNSWEFSearch() int {
 	return int(hnswEFSearchValue.Load())
+}
+
+func getHNSWExactRerankTopN() int {
+	return int(hnswExactRerankTopNValue.Load())
 }
 
 func getHNSWTombstoneRebuildRatio() float64 {

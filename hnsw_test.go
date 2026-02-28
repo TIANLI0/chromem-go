@@ -7,6 +7,39 @@ import (
 	"testing"
 )
 
+func TestHNSWSelectNeighbors_DiversifyThenFill(t *testing.T) {
+	idx := &hnswIndex{
+		nodes: []hnswNode{
+			{doc: &Document{ID: "a", Embedding: []float32{1, 0}}},
+			{doc: &Document{ID: "b", Embedding: []float32{1, 0}}},
+			{doc: &Document{ID: "c", Embedding: []float32{1, 0}}},
+		},
+	}
+
+	candidates := []hnswCandidate{
+		{id: 0, similarity: 0.80},
+		{id: 1, similarity: 0.70},
+		{id: 2, similarity: 0.60},
+	}
+
+	selected := idx.selectNeighbors(candidates, 2)
+	if len(selected) != 2 {
+		t.Fatalf("expected 2 neighbors, got %d", len(selected))
+	}
+	if selected[0] != 0 || selected[1] != 1 {
+		t.Fatalf("expected [0 1], got %v", selected)
+	}
+
+	idx.setDeleted(1, true)
+	selected = idx.selectNeighbors(candidates, 2)
+	if len(selected) != 2 {
+		t.Fatalf("expected 2 neighbors with deleted candidate skipped, got %d", len(selected))
+	}
+	if selected[0] != 0 || selected[1] != 2 {
+		t.Fatalf("expected [0 2] when candidate 1 is deleted, got %v", selected)
+	}
+}
+
 func TestCollection_QueryEmbedding_HNSWRebuildOnMutation(t *testing.T) {
 	db := NewDB()
 	c, err := db.CreateCollection("hnsw-rebuild", nil, nil)
