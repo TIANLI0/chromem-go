@@ -17,6 +17,8 @@ The focus is not scale (millions of documents) or number of features, but simpli
 
 > ⚠️ The project is in beta, under heavy construction, and may introduce breaking changes in releases before `v1.0.0`. All changes are documented in the [`CHANGELOG`](./CHANGELOG.md).
 
+> Attention: Becase of using `simd` Go experiment, the minimum required Go version is `1.26.0`, and you need to set `GOEXPERIMENT=simd` to enable SIMD optimizations. See [Performance tuning (SIMD + concurrency)](#performance-tuning-simd--concurrency) for details.
+
 ## Contents
 
 1. [Use cases](#use-cases)
