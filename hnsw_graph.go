@@ -222,12 +222,7 @@ func (h *hnswIndex) selectNeighborsInternal(candidates []hnswCandidate, limit in
 	selected := make([]int, 0, min(limit, len(candidates)))
 
 	containsSelected := func(id int) bool {
-		for _, existing := range selected {
-			if existing == id {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(selected, id)
 	}
 
 	for _, candidate := range candidates {
