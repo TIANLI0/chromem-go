@@ -15,7 +15,11 @@ func TestPersistenceWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal("expected nil, got", err)
 	}
-	defer os.RemoveAll(tempDir)
+	t.Cleanup(func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("cleanup failed: couldn't remove temp dir %q: %v", tempDir, err)
+		}
+	})
 
 	type s struct {
 		Foo string
@@ -43,7 +47,9 @@ func TestPersistenceWrite(t *testing.T) {
 		if err != nil {
 			t.Fatal("expected nil, got", err)
 		}
-		defer f.Close()
+		defer func() {
+			_ = f.Close()
+		}()
 		d := gob.NewDecoder(f)
 		res := s{}
 		err = d.Decode(&res)
@@ -74,7 +80,9 @@ func TestPersistenceWrite(t *testing.T) {
 		if err != nil {
 			t.Fatal("expected nil, got", err)
 		}
-		defer f.Close()
+		defer func() {
+			_ = f.Close()
+		}()
 		gzr, err := gzip.NewReader(f)
 		if err != nil {
 			t.Fatal("expected nil, got", err)
@@ -98,7 +106,11 @@ func TestPersistenceRead(t *testing.T) {
 	if err != nil {
 		t.Fatal("expected nil, got", err)
 	}
-	defer os.RemoveAll(tempDir)
+	t.Cleanup(func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("cleanup failed: couldn't remove temp dir %q: %v", tempDir, err)
+		}
+	})
 
 	type s struct {
 		Foo string

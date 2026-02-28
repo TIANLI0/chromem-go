@@ -1008,7 +1008,11 @@ func BenchmarkCollection_Query_NoContent_1536_Approx1GiB_PersistentModes(b *test
 	if err != nil {
 		b.Fatal("expected no error, got", err)
 	}
-	defer os.RemoveAll(baseDir)
+	b.Cleanup(func() {
+		if err := os.RemoveAll(baseDir); err != nil {
+			b.Errorf("cleanup failed: couldn't remove temp dir %q: %v", baseDir, err)
+		}
+	})
 
 	dataDir := filepath.Join(baseDir, "data")
 	sourceDB, err := NewPersistentDBWithOptions(dataDir, PersistentDBOptions{Compress: false})

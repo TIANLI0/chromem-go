@@ -64,7 +64,9 @@ func persistToFile(filePath string, obj any, compress bool, encryptionKey string
 	if err != nil {
 		return fmt.Errorf("couldn't create file: %w", err)
 	}
-	defer f.Close()
+	defer func() {
+		_ = f.Close()
+	}()
 
 	return persistToWriter(f, obj, compress, encryptionKey)
 }
@@ -167,7 +169,9 @@ func readFromFile(filePath string, obj any, encryptionKey string) error {
 	if err != nil {
 		return fmt.Errorf("couldn't open file: %w", err)
 	}
-	defer r.Close()
+	defer func() {
+		_ = r.Close()
+	}()
 
 	return readFromReader(r, obj, encryptionKey)
 }
@@ -250,7 +254,9 @@ func readFromReader(r io.ReadSeeker, obj any, encryptionKey string) error {
 		if err != nil {
 			return fmt.Errorf("couldn't create gzip reader: %w", err)
 		}
-		defer gzr.Close()
+		defer func() {
+			_ = gzr.Close()
+		}()
 		chainedReader = gzr
 	}
 

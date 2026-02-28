@@ -11,12 +11,21 @@ import (
 	"testing"
 )
 
+func cleanupRemoveAll(t *testing.T, path string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := os.RemoveAll(path); err != nil {
+			t.Errorf("cleanup failed: couldn't remove %q: %v", path, err)
+		}
+	})
+}
+
 func TestNewPersistentDB(t *testing.T) {
 	t.Run("Create directory", func(t *testing.T) {
 		r := rand.New(rand.NewSource(rand.Int63()))
 		randString := randomPathComponent(r, 10)
 		path := filepath.Join(os.TempDir(), randString)
-		defer os.RemoveAll(path)
+		cleanupRemoveAll(t, path)
 
 		// Path shouldn't exist yet
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -41,7 +50,7 @@ func TestNewPersistentDB(t *testing.T) {
 		if err != nil {
 			t.Fatal("couldn't create temp dir:", err)
 		}
-		defer os.RemoveAll(path)
+		cleanupRemoveAll(t, path)
 
 		db, err := NewPersistentDB(path, false)
 		if err != nil {
@@ -59,7 +68,10 @@ func TestNewPersistentDB_Errors(t *testing.T) {
 		if err != nil {
 			t.Fatal("couldn't create temp file:", err)
 		}
-		defer os.RemoveAll(f.Name())
+		if err := f.Close(); err != nil {
+			t.Fatal("couldn't close temp file:", err)
+		}
+		cleanupRemoveAll(t, f.Name())
 
 		_, err = NewPersistentDB(f.Name(), false)
 		if err == nil {
@@ -74,7 +86,7 @@ func TestNewPersistentDBWithOptions_LazyLoadPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal("couldn't create temp dir:", err)
 	}
-	defer os.RemoveAll(path)
+	cleanupRemoveAll(t, path)
 
 	makeEmbed := func(_ context.Context, _ string) ([]float32, error) {
 		return []float32{1, 0}, nil
@@ -144,7 +156,7 @@ func TestNewPersistentDBWithOptions_LazyLoadPayload_Export(t *testing.T) {
 	if err != nil {
 		t.Fatal("couldn't create temp dir:", err)
 	}
-	defer os.RemoveAll(path)
+	cleanupRemoveAll(t, path)
 
 	db, err := NewPersistentDB(path, false)
 	if err != nil {
@@ -205,7 +217,7 @@ func TestNewPersistentDBWithOptions_StreamEmbeddingsOnQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal("couldn't create temp dir:", err)
 	}
-	defer os.RemoveAll(path)
+	cleanupRemoveAll(t, path)
 
 	db, err := NewPersistentDB(path, false)
 	if err != nil {
@@ -264,7 +276,7 @@ func TestNewPersistentDBWithOptions_StreamEmbeddingsOnQuery_Export(t *testing.T)
 	if err != nil {
 		t.Fatal("couldn't create temp dir:", err)
 	}
-	defer os.RemoveAll(path)
+	cleanupRemoveAll(t, path)
 
 	db, err := NewPersistentDB(path, false)
 	if err != nil {
@@ -323,7 +335,7 @@ func TestDB_ImportExport(t *testing.T) {
 	r := rand.New(rand.NewSource(rand.Int63()))
 	randString := randomPathComponent(r, 10)
 	path := filepath.Join(os.TempDir(), randString)
-	defer os.RemoveAll(path)
+	cleanupRemoveAll(t, path)
 
 	// Values in the collection
 	name := "test"
@@ -431,7 +443,7 @@ func TestDB_ImportExportSpecificCollections(t *testing.T) {
 	randString := randomPathComponent(r, 10)
 	path := filepath.Join(os.TempDir(), randString)
 	filePath := path + ".gob"
-	defer os.RemoveAll(path)
+	cleanupRemoveAll(t, path)
 
 	// Values in the collection
 	name := "test"
@@ -488,7 +500,7 @@ func TestDB_ImportExportSpecificCollections(t *testing.T) {
 	}
 
 	dir := filepath.Join(path, randomPathComponent(r, 10))
-	defer os.RemoveAll(dir)
+	cleanupRemoveAll(t, dir)
 
 	// Instead of importing to an in-memory DB we use a persistent one to cover the behavior of immediate persistent files being created for the imported data
 	newPDB, err := NewPersistentDB(dir, false)

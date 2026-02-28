@@ -89,7 +89,7 @@ func (h *hnswIndex) clone() *hnswIndex {
 			neighbors[level] = slices.Clone(node.neighbors[level])
 		}
 
-		embedding := node.embedding
+		var embedding []float32
 		if node.embeddingOffset >= 0 && node.embeddingOffset+h.dim <= len(embeddingArena) {
 			embedding = embeddingArena[node.embeddingOffset : node.embeddingOffset+h.dim]
 		} else {

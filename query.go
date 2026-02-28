@@ -76,7 +76,8 @@ func (d *maxDocSims) values() []docSim {
 
 var documentSlicePool = sync.Pool{
 	New: func() any {
-		return make([]*Document, 0, 256)
+		s := make([]*Document, 0, 256)
+		return &s
 	},
 }
 
@@ -84,7 +85,7 @@ const maxPooledDocumentSliceCapacity = 16_384
 
 // acquireDocumentSlice gets a slice of documents from the pool with at least the specified capacity.
 func acquireDocumentSlice(minCapacity int) []*Document {
-	s := documentSlicePool.Get().([]*Document)
+	s := *(documentSlicePool.Get().(*[]*Document))
 	if cap(s) < minCapacity {
 		return make([]*Document, 0, minCapacity)
 	}
@@ -96,7 +97,8 @@ func releaseDocumentSlice(s []*Document) {
 	if s == nil || cap(s) > maxPooledDocumentSliceCapacity {
 		return
 	}
-	documentSlicePool.Put(s[:0])
+	s = s[:0]
+	documentSlicePool.Put(&s)
 }
 
 func queryConcurrency(numDocs int, vectorDim int) int {

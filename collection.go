@@ -313,7 +313,6 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 	if c.persistDirectory != "" {
 		doc.persistPath = c.getDocPath(doc.ID)
 	}
-	_, existed := c.documents[doc.ID]
 	// We don't defer the unlock because we want to do it earlier.
 	c.documents[doc.ID] = &doc
 	c.docsListValid = false
@@ -342,11 +341,6 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 	if !upserted {
 		c.markHNSWDirty()
 		c.removePersistedHNSWIndexBestEffort()
-	} else if existed {
-		// Keep docsList snapshot and index versions coherent after overwrite.
-		// Incremental upsert already advances index versions.
-	} else {
-		// Nothing else to do.
 	}
 
 	return nil
@@ -950,7 +944,7 @@ func (c *Collection) getMostSimilarDocsANN(queryEmbedding []float32, nResults in
 		}
 		out := make([]docSim, 0, len(neighbors))
 		for _, n := range neighbors {
-			out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+			out = append(out, docSim(n))
 		}
 		if len(out) < nResults {
 			return nil, nil
@@ -963,7 +957,7 @@ func (c *Collection) getMostSimilarDocsANN(queryEmbedding []float32, nResults in
 		}
 		out := make([]docSim, 0, len(neighbors))
 		for _, n := range neighbors {
-			out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+			out = append(out, docSim(n))
 		}
 		if len(out) < nResults {
 			return nil, nil
@@ -976,7 +970,7 @@ func (c *Collection) getMostSimilarDocsANN(queryEmbedding []float32, nResults in
 		}
 		out := make([]docSim, 0, len(neighbors))
 		for _, n := range neighbors {
-			out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+			out = append(out, docSim(n))
 		}
 		if len(out) < nResults {
 			return nil, nil
