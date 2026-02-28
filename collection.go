@@ -1001,7 +1001,7 @@ func (c *Collection) getMostRelevantDocsBM25(queryText string, nResults int) ([]
 	neighbors := idx.Search(queryText, nResults)
 	out := make([]docSim, 0, len(neighbors))
 	for _, n := range neighbors {
-		out = append(out, docSim{doc: n.doc, similarity: n.similarity})
+		out = append(out, docSim(n))
 	}
 	return out, nil
 }
