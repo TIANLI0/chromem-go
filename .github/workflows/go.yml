@@ -14,35 +14,33 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # We make use of the `slices` feature, only available in 1.21 and newer
-        go-version: [ '1.21', '1.22', '1.23' ]
+        go-version: [ '1.26.0' ]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6.0.2
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v6.3.0
       with:
         go-version: ${{ matrix.go-version }}
 
     - name: Lint
-      uses: golangci/golangci-lint-action@v6
+      uses: golangci/golangci-lint-action@v9.2.0
       with:
-        version: v1.60.3
+        version: latest
         args: --verbose
 
   build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # We make use of the `slices` feature, only available in 1.21 and newer
-        go-version: [ '1.21', '1.22', '1.23' ]
+        go-version: [ '1.26.0' ]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6.0.2
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v6.3.0
       with:
         go-version: ${{ matrix.go-version }}
 
@@ -56,14 +54,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # We make use of the `slices` feature, only available in 1.21 and newer
-        go-version: [ '1.21', '1.22', '1.23' ]
+        go-version: [ '1.26.0' ]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6.0.2
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v6.3.0
       with:
         go-version: ${{ matrix.go-version }}
 
